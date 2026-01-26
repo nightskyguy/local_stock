@@ -48,8 +48,8 @@ def initialize_portfolio():
     
     PORTFOLIO_SYMBOLS = [
         'BND', 'BOXX', 'AAPL', 'CSCO', 'CSOAX', 'EFA', 'FNILX', 'FZROX',
-        'HYDB', 'HYGH', 'IBIT', 'IVV', 'QQQ', 'SCHD', 'SMYX', 'STAYX',
-        'SUSTX', 'FDEV', 'FISOX', 'VIG', 'VOO', 'VTI', 'VWEHX', 'VWO'
+        'HYDB', 'HYGH', 'IBIT', 'IVV', 'QQQ', 'SCHD', 'SIYYX', 'STAYX',
+        'SUSYX', 'TSLA', 'VASGX', 'VIOO', 'VOO', 'VTI', 'VWEHX', 'VWO'
     ]
     
     try:
