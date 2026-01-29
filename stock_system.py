@@ -1,0 +1,1155 @@
+"""
+File: stock_system.py
+Unified Stock Quote Management System
+
+Features:
+- Local SQLite database for historical quotes
+- Multi-source data fetching (yfinance, Alpha Vantage, FMP, Finnhub)
+- Web server for LibreOffice Calc integration
+- Live quote caching with configurable duration
+- Automatic daily updates at scheduled time
+- Smart incremental updates (only fetch new dates)
+- Market closure detection and tracking
+- CLI interface for all operations
+
+Usage:
+    # Server mode
+    python stock_system.py --server [--db path]
+    
+    # Symbol management
+    python stock_system.py --init
+    python stock_system.py --add AAPL --add CSCO --add TSLA
+    python stock_system.py --remove SYMBOL
+    
+    # Updates
+    python stock_system.py --update [--years N]
+    python stock_system.py --trigger-update
+    
+    # Configuration
+    python stock_system.py --config list
+    python stock_system.py --config set KEY VALUE
+    python stock_system.py --config set apikey SOURCE KEY
+    
+    # Info
+    python stock_system.py --stats
+    python stock_system.py --dbpath
+
+Web API:
+    http://localhost:5000/quote/AAPL              - Latest close
+    http://localhost:5000/quote/AAPL/now          - Live quote (cached 15min)
+    http://localhost:5000/quote/AAPL/2025-01-15   - Historical quote
+    http://localhost:5000/quote/AAPL/field/high   - Specific field
+    http://localhost:5000/latest_date/AAPL        - Most recent date
+"""
+
+import sqlite3
+import argparse
+import os
+import sys
+import logging
+from datetime import datetime, timedelta
+import time
+import yfinance as yf
+import pandas as pd
+from flask import Flask, jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+DEFAULT_DB_PATH = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_quotes.db')
+LOG_PATH = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system.log')
+
+# Reference symbols for market closure detection (must have 4+ years of data)
+REFERENCE_SYMBOLS = ['QQQ', 'CSCO']
+
+# Default configuration values
+DEFAULT_CONFIG = {
+    'update_time': '15:30',           # 3:30 PM local time
+    'cache_duration': '900',          # 15 minutes in seconds
+    'default_years': '3',             # Default history to fetch
+    'apikey_alphavantage': '',
+    'apikey_fmp': '',
+    'apikey_finnhub': '',
+    'active_source': 'yfinance',
+    'source_priority_1': 'yfinance',
+    'source_priority_2': 'alphavantage',
+    'source_priority_3': 'fmp',
+    'source_priority_4': 'finnhub',
+}
+
+# Setup logging
+logging.basicConfig(
+    filename=LOG_PATH,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Global database path (can be overridden by --db argument)
+DB_PATH = DEFAULT_DB_PATH
+
+# Live quote cache
+live_quote_cache = {}  # {symbol: (price, timestamp)}
+cache_lock = threading.Lock()
+
+# ============================================================================
+# DATABASE LAYER
+# ============================================================================
+
+def get_db_connection():
+    """Get database connection"""
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def setup_database():
+    """Initialize database with all required tables"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Config table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            description TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Symbols table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS symbols (
+            symbol TEXT PRIMARY KEY,
+            name TEXT,
+            notes TEXT,
+            first_fetch_date TEXT,
+            last_fetch_date TEXT,
+            active INTEGER DEFAULT 1,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Daily quotes table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_quotes (
+            symbol TEXT NOT NULL,
+            quote_date TEXT NOT NULL,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume INTEGER,
+            dividends REAL DEFAULT 0,
+            stock_splits REAL DEFAULT 0,
+            data_source TEXT,
+            last_updated TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (symbol, quote_date)
+        )
+    ''')
+    
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_symbol_date ON daily_quotes(symbol, quote_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_date ON daily_quotes(quote_date)')
+    
+    # Market closures table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS market_closures (
+            date TEXT PRIMARY KEY,
+            confirmed_count INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Data sources table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS data_sources (
+            source_name TEXT PRIMARY KEY,
+            api_key TEXT,
+            rate_limit INTEGER,
+            enabled INTEGER DEFAULT 1,
+            priority INTEGER DEFAULT 99,
+            notes TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    logger.info(f"Database initialized: {DB_PATH}")
+
+def initialize_default_config():
+    """Insert default configuration values"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    for key, value in DEFAULT_CONFIG.items():
+        cursor.execute('''
+            INSERT OR IGNORE INTO config (key, value, description)
+            VALUES (?, ?, ?)
+        ''', (key, value, f'Default: {value}'))
+    
+    conn.commit()
+    conn.close()
+    logger.info("Default configuration initialized")
+
+def initialize_data_sources():
+    """Initialize data sources table"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    sources = [
+        ('yfinance', '', 2000, 1, 1, 'Yahoo Finance via yfinance - Free, no API key'),
+        ('alphavantage', '', 25, 0, 2, 'Alpha Vantage - Free tier: 25 req/day'),
+        ('fmp', '', 250, 0, 3, 'Financial Modeling Prep - Free tier: 250 req/day'),
+        ('finnhub', '', 60, 0, 4, 'Finnhub - Free tier: 60 calls/min'),
+    ]
+    
+    for source in sources:
+        cursor.execute('''
+            INSERT OR IGNORE INTO data_sources (source_name, api_key, rate_limit, enabled, priority, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', source)
+    
+    conn.commit()
+    conn.close()
+    logger.info("Data sources initialized")
+
+# ============================================================================
+# CONFIGURATION MANAGEMENT
+# ============================================================================
+
+def get_config(key):
+    """Get configuration value"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT value FROM config WHERE key = ?', (key,))
+    result = cursor.fetchone()
+    conn.close()
+    return result['value'] if result else None
+
+def set_config(key, value):
+    """Set configuration value"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO config (key, value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+    ''', (key, value))
+    conn.commit()
+    conn.close()
+    logger.info(f"Config updated: {key} = {value}")
+
+def list_config():
+    """List all configuration"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT key, value, description FROM config ORDER BY key')
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+def set_api_key(source, key):
+    """Set API key for data source"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE data_sources SET api_key = ? WHERE source_name = ?', (key, source))
+    conn.commit()
+    conn.close()
+    
+    # Also update config table for compatibility
+    set_config(f'apikey_{source}', key)
+    logger.info(f"API key set for {source}")
+
+# ============================================================================
+# SYMBOL MANAGEMENT
+# ============================================================================
+
+def add_symbol(symbol):
+    """Add symbol to tracked list"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('''
+            INSERT INTO symbols (symbol, active)
+            VALUES (?, 1)
+        ''', (symbol.upper(),))
+        conn.commit()
+        logger.info(f"Symbol added: {symbol.upper()}")
+        print(f"Added symbol: {symbol.upper()}")
+        return True
+    except sqlite3.IntegrityError:
+        logger.warning(f"Symbol already exists: {symbol.upper()}")
+        print(f"Symbol already exists: {symbol.upper()}")
+        return False
+    finally:
+        conn.close()
+
+def remove_symbol(symbol):
+    """Remove symbol and all its data"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check if symbol exists
+    cursor.execute('SELECT COUNT(*) as count FROM symbols WHERE symbol = ?', (symbol.upper(),))
+    if cursor.fetchone()['count'] == 0:
+        print(f"Symbol not found: {symbol.upper()}")
+        conn.close()
+        return
+    
+    # Confirm deletion
+    cursor.execute('SELECT COUNT(*) as count FROM daily_quotes WHERE symbol = ?', (symbol.upper(),))
+    quote_count = cursor.fetchone()['count']
+    
+    response = input(f"Delete {symbol.upper()} and {quote_count} quotes? (yes/no): ")
+    if response.lower() != 'yes':
+        print("Cancelled")
+        conn.close()
+        return
+    
+    # Delete data
+    cursor.execute('DELETE FROM daily_quotes WHERE symbol = ?', (symbol.upper(),))
+    cursor.execute('DELETE FROM symbols WHERE symbol = ?', (symbol.upper(),))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"Symbol removed: {symbol.upper()} ({quote_count} quotes deleted)")
+    print(f"Removed {symbol.upper()} and {quote_count} quotes")
+
+def get_tracked_symbols():
+    """Get list of active symbols"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT symbol FROM symbols WHERE active = 1 ORDER BY symbol')
+    symbols = [row['symbol'] for row in cursor.fetchall()]
+    conn.close()
+    return symbols
+
+def update_symbol_tracking(symbol):
+    """Update first/last fetch dates for symbol"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT MIN(quote_date) as first, MAX(quote_date) as last
+        FROM daily_quotes
+        WHERE symbol = ?
+    ''', (symbol,))
+    
+    result = cursor.fetchone()
+    if result and result['first']:
+        cursor.execute('''
+            UPDATE symbols
+            SET first_fetch_date = ?, last_fetch_date = ?
+            WHERE symbol = ?
+        ''', (result['first'], result['last'], symbol))
+        conn.commit()
+    
+    conn.close()
+
+# ============================================================================
+# MARKET CLOSURE DETECTION
+# ============================================================================
+
+def get_market_closures():
+    """Get set of known market closure dates"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT date FROM market_closures')
+    closures = {row['date'] for row in cursor.fetchall()}
+    conn.close()
+    return closures
+
+def mark_market_closure(date):
+    """Mark a date as market closure"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO market_closures (date, confirmed_count, created_at)
+        VALUES (?, 1, CURRENT_TIMESTAMP)
+    ''', (date,))
+    conn.commit()
+    conn.close()
+    logger.info(f"Marked market closure: {date}")
+
+def detect_market_closures(symbol, failed_dates):
+    """
+    Detect market closures based on failed fetch attempts
+    Mark as closure if:
+    - Symbol is a reference symbol (QQQ or CSCO) and fetch failed
+    - 4+ regular symbols failed on same date
+    """
+    if not failed_dates:
+        return
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    is_reference = symbol in REFERENCE_SYMBOLS
+    
+    for date_str in failed_dates:
+        # Skip weekends
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        if date_obj.weekday() >= 5:
+            continue
+        
+        if is_reference:
+            # Reference symbol failed - mark immediately
+            mark_market_closure(date_str)
+        else:
+            # Count how many symbols failed on this date
+            # We track this by seeing how many symbols have NO data for this date
+            # but DO have data before and after it
+            cursor.execute('''
+                SELECT COUNT(DISTINCT s.symbol) as count
+                FROM symbols s
+                WHERE s.active = 1
+                AND EXISTS (
+                    SELECT 1 FROM daily_quotes dq1
+                    WHERE dq1.symbol = s.symbol AND dq1.quote_date < ?
+                )
+                AND EXISTS (
+                    SELECT 1 FROM daily_quotes dq2
+                    WHERE dq2.symbol = s.symbol AND dq2.quote_date > ?
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM daily_quotes dq3
+                    WHERE dq3.symbol = s.symbol AND dq3.quote_date = ?
+                )
+            ''', (date_str, date_str, date_str))
+            
+            failed_count = cursor.fetchone()['count']
+            
+            if failed_count >= 4:
+                mark_market_closure(date_str)
+    
+    conn.close()
+
+# ============================================================================
+# DATA FETCHING
+# ============================================================================
+
+def fetch_yfinance(symbol, start_date, end_date):
+    """Fetch data from Yahoo Finance via yfinance"""
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(start=start_date, end=end_date)
+        
+        if df.empty:
+            return None
+        
+        quotes = []
+        for date, row in df.iterrows():
+            quotes.append({
+                'symbol': symbol,
+                'quote_date': date.strftime('%Y-%m-%d'),
+                'open': float(row['Open']) if pd.notna(row['Open']) else None,
+                'high': float(row['High']) if pd.notna(row['High']) else None,
+                'low': float(row['Low']) if pd.notna(row['Low']) else None,
+                'close': float(row['Close']) if pd.notna(row['Close']) else None,
+                'volume': int(row['Volume']) if pd.notna(row['Volume']) else 0,
+                'dividends': float(row.get('Dividends', 0)) if pd.notna(row.get('Dividends', 0)) else 0,
+                'stock_splits': float(row.get('Stock Splits', 0)) if pd.notna(row.get('Stock Splits', 0)) else 0,
+                'data_source': 'yfinance'
+            })
+        
+        return quotes
+    
+    except Exception as e:
+        logger.error(f"yfinance fetch failed for {symbol}: {e}")
+        return None
+
+def fetch_live_quote_yfinance(symbol):
+    """Fetch current live quote from yfinance"""
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        
+        # Try different price fields
+        price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+        
+        if price:
+            return float(price)
+        return None
+    
+    except Exception as e:
+        logger.error(f"Live quote fetch failed for {symbol}: {e}")
+        return None
+
+def get_enabled_sources():
+    """Get list of enabled data sources in priority order"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT source_name, api_key
+        FROM data_sources
+        WHERE enabled = 1
+        ORDER BY priority ASC
+    ''')
+    sources = cursor.fetchall()
+    conn.close()
+    return [(row['source_name'], row['api_key']) for row in sources]
+
+def fetch_data_multi_source(symbol, start_date, end_date):
+    """Fetch data trying multiple sources with fallback"""
+    sources = get_enabled_sources()
+    
+    for source_name, api_key in sources:
+        logger.info(f"Trying {source_name} for {symbol}")
+        
+        if source_name == 'yfinance':
+            quotes = fetch_yfinance(symbol, start_date, end_date)
+            if quotes:
+                return quotes
+        # Add other sources here (alphavantage, fmp, finnhub) as needed
+    
+    logger.error(f"All sources failed for {symbol}")
+    return None
+
+def save_quotes(quotes):
+    """Save quotes to database"""
+    if not quotes:
+        return 0
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    saved = 0
+    for quote in quotes:
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO daily_quotes 
+                (symbol, quote_date, open, high, low, close, volume, dividends, stock_splits, data_source, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (
+                quote['symbol'], quote['quote_date'],
+                quote.get('open'), quote.get('high'), quote.get('low'),
+                quote.get('close'), quote.get('volume', 0),
+                quote.get('dividends', 0), quote.get('stock_splits', 0),
+                quote.get('data_source', 'unknown')
+            ))
+            saved += 1
+        except Exception as e:
+            logger.error(f"Error saving quote for {quote['symbol']} on {quote['quote_date']}: {e}")
+    
+    conn.commit()
+    conn.close()
+    
+    return saved
+
+def get_last_date_for_symbol(symbol):
+    """Get the most recent date we have data for"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT MAX(quote_date) as last_date
+        FROM daily_quotes
+        WHERE symbol = ?
+    ''', (symbol,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result and result['last_date']:
+        return datetime.strptime(result['last_date'], '%Y-%m-%d').date()
+    return None
+
+def get_missing_dates(symbol, start_date, end_date):
+    """Get list of missing dates (weekdays only, excluding known closures)"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT quote_date
+        FROM daily_quotes
+        WHERE symbol = ? AND quote_date BETWEEN ? AND ?
+    ''', (symbol, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')))
+    
+    existing = {row['quote_date'] for row in cursor.fetchall()}
+    conn.close()
+    
+    # Get known market closures
+    closures = get_market_closures()
+    
+    # Generate expected dates
+    expected = set()
+    current = start_date
+    while current <= end_date:
+        # Only weekdays
+        if current.weekday() < 5:
+            date_str = current.strftime('%Y-%m-%d')
+            # Skip known closures
+            if date_str not in closures:
+                expected.add(date_str)
+        current += timedelta(days=1)
+    
+    missing = expected - existing
+    return sorted(list(missing))
+
+# ============================================================================
+# SMART UPDATE LOGIC
+# ============================================================================
+
+def smart_update_symbol(symbol, years=None):
+    """
+    Smart update that only fetches missing data
+    - New symbols: fetch full history (years parameter or default)
+    - Existing symbols: fetch from last date forward
+    """
+    last_date = get_last_date_for_symbol(symbol)
+    today = datetime.now().date()
+    
+    if last_date is None:
+        # New symbol: fetch full history
+        if years is None:
+            years = int(get_config('default_years') or 3)
+        start_date = today - timedelta(days=365 * years)
+        logger.info(f"New symbol {symbol}: fetching {years} years of history")
+    else:
+        # Existing symbol: fetch from last date + 1
+        start_date = last_date + timedelta(days=1)
+        logger.info(f"Updating {symbol} from {start_date}")
+    
+    # Don't fetch if we're already up to date
+    if start_date > today:
+        logger.info(f"{symbol} already up to date")
+        return True
+    
+    # Fetch data
+    quotes = fetch_data_multi_source(symbol, start_date.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d'))
+    
+    if quotes:
+        saved = save_quotes(quotes)
+        update_symbol_tracking(symbol)
+        logger.info(f"Saved {saved} quotes for {symbol}")
+        
+        # Detect market closures based on missing dates
+        missing = get_missing_dates(symbol, start_date, today)
+        if missing:
+            detect_market_closures(symbol, missing[:10])  # Check first 10 missing dates
+        
+        return True
+    else:
+        logger.warning(f"No data fetched for {symbol}")
+        return False
+
+def update_all_symbols(years=None):
+    """Update all active symbols"""
+    symbols = get_tracked_symbols()
+    
+    if not symbols:
+        print("No symbols to update")
+        logger.warning("No symbols to update")
+        return
+    
+    print(f"Updating {len(symbols)} symbols...")
+    logger.info(f"Starting update for {len(symbols)} symbols")
+    
+    success_count = 0
+    for i, symbol in enumerate(symbols, 1):
+        print(f"[{i}/{len(symbols)}] Updating {symbol}...")
+        if smart_update_symbol(symbol, years):
+            success_count += 1
+    
+    print(f"\nUpdate complete: {success_count}/{len(symbols)} symbols updated successfully")
+    logger.info(f"Update complete: {success_count}/{len(symbols)} successful")
+
+def auto_fetch_symbol(symbol):
+    """Auto-fetch a new symbol (30 days of data)"""
+    logger.info(f"Auto-fetching new symbol: {symbol}")
+    
+    # Add symbol if not exists
+    add_symbol(symbol)
+    
+    # Fetch 30 days
+    today = datetime.now().date()
+    start_date = today - timedelta(days=30)
+    
+    quotes = fetch_data_multi_source(symbol, start_date.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d'))
+    
+    if quotes:
+        saved = save_quotes(quotes)
+        update_symbol_tracking(symbol)
+        logger.info(f"Auto-fetched {saved} quotes for {symbol}")
+        return True
+    else:
+        logger.warning(f"Auto-fetch failed for {symbol}")
+        return False
+
+# ============================================================================
+# LIVE QUOTE CACHING
+# ============================================================================
+
+def is_market_open():
+    """Check if market is open (9:30 AM - 4:00 PM local time, Mon-Fri)"""
+    now = datetime.now()
+    
+    # Weekend check
+    if now.weekday() >= 5:
+        return False
+    
+    # Time check (local timezone)
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    
+    return market_open <= now <= market_close
+
+def get_live_quote(symbol):
+    """Get live quote with caching"""
+    with cache_lock:
+        now = time.time()
+        cache_duration = int(get_config('cache_duration') or 900)
+        
+        # Check cache
+        if symbol in live_quote_cache:
+            price, timestamp = live_quote_cache[symbol]
+            if now - timestamp < cache_duration:
+                logger.debug(f"Cache hit for {symbol}")
+                return price
+        
+        # Fetch live quote if market open
+        if is_market_open():
+            logger.info(f"Fetching live quote for {symbol}")
+            price = fetch_live_quote_yfinance(symbol)
+            
+            if price:
+                live_quote_cache[symbol] = (price, now)
+                return price
+        
+        # Fallback: get last close from database
+        logger.info(f"Market closed or fetch failed, returning last close for {symbol}")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT close FROM daily_quotes
+            WHERE symbol = ?
+            ORDER BY quote_date DESC
+            LIMIT 1
+        ''', (symbol,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result and result['close']:
+            return result['close']
+        
+        return None
+
+# ============================================================================
+# STATISTICS
+# ============================================================================
+
+def show_statistics():
+    """Show database statistics"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Total quotes
+    cursor.execute('SELECT COUNT(*) as count FROM daily_quotes')
+    total_quotes = cursor.fetchone()['count']
+    
+    # Symbol breakdown
+    cursor.execute('''
+        SELECT s.symbol, COUNT(dq.quote_date) as quotes,
+               MIN(dq.quote_date) as first_date,
+               MAX(dq.quote_date) as last_date
+        FROM symbols s
+        LEFT JOIN daily_quotes dq ON s.symbol = dq.symbol
+        WHERE s.active = 1
+        GROUP BY s.symbol
+        ORDER BY s.symbol
+    ''')
+    symbols = cursor.fetchall()
+    
+    # Market closures
+    cursor.execute('SELECT COUNT(*) as count FROM market_closures')
+    closure_count = cursor.fetchone()['count']
+    
+    conn.close()
+    
+    print(f"\n{'='*70}")
+    print(f"Database: {DB_PATH}")
+    print(f"Total Quotes: {total_quotes:,}")
+    print(f"Market Closures Detected: {closure_count}")
+    print(f"{'='*70}")
+    print(f"{'Symbol':<10} {'Quotes':>10} {'First Date':<12} {'Last Date':<12}")
+    print(f"{'-'*70}")
+    
+    for row in symbols:
+        print(f"{row['symbol']:<10} {row['quotes']:>10,} {row['first_date'] or 'N/A':<12} {row['last_date'] or 'N/A':<12}")
+    
+    print(f"{'='*70}\n")
+
+# ============================================================================
+# WEB SERVER
+# ============================================================================
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    """Show API documentation"""
+    return """
+    <h1>Stock Quote Server</h1>
+    <p>Server is running!</p>
+    <h2>API Endpoints:</h2>
+    <ul>
+        <li><code>/quote/&lt;symbol&gt;</code> - Latest close price</li>
+        <li><code>/quote/&lt;symbol&gt;/now</code> - Live quote (15min cache)</li>
+        <li><code>/quote/&lt;symbol&gt;/&lt;date&gt;</code> - Price on specific date (YYYY-MM-DD)</li>
+        <li><code>/quote/&lt;symbol&gt;/field/&lt;field&gt;</code> - Latest value for field (open, high, low, close, volume)</li>
+        <li><code>/latest_date/&lt;symbol&gt;</code> - Most recent date with data</li>
+        <li><code>/config</code> - View configuration (read-only)</li>
+        <li><code>/health</code> - Server health check</li>
+    </ul>
+    <h2>Examples:</h2>
+    <ul>
+        <li><a href="/quote/AAPL">/quote/AAPL</a></li>
+        <li><a href="/quote/AAPL/now">/quote/AAPL/now</a></li>
+        <li><a href="/quote/CSCO/2025-01-15">/quote/CSCO/2025-01-15</a></li>
+        <li><a href="/quote/AAPL/field/high">/quote/AAPL/field/high</a></li>
+        <li><a href="/latest_date/AAPL">/latest_date/AAPL</a></li>
+        <li><a href="/config">/config</a></li>
+    </ul>
+    """
+
+@app.route('/health')
+def health():
+    """Health check"""
+    db_exists = os.path.exists(DB_PATH)
+    
+    if not db_exists:
+        return jsonify({'status': 'error', 'message': 'Database not found'}), 500
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) as count FROM daily_quotes')
+        quote_count = cursor.fetchone()['count']
+        conn.close()
+        
+        return jsonify({
+            'status': 'ok',
+            'database': DB_PATH,
+            'quotes': quote_count
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/config')
+def view_config():
+    """View current configuration"""
+    try:
+        config = list_config()
+        return jsonify({item['key']: item['value'] for item in config})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/quote/<symbol>')
+def get_quote_endpoint(symbol):
+    """Get latest close price"""
+    return get_quote_helper(symbol.upper(), field='close')
+
+@app.route('/quote/<symbol>/now')
+def get_live_quote_endpoint(symbol):
+    """Get live quote with caching"""
+    try:
+        price = get_live_quote(symbol.upper())
+        
+        if price is not None:
+            return str(price)
+        else:
+            # Try auto-fetch if not in database
+            if auto_fetch_symbol(symbol.upper()):
+                price = get_live_quote(symbol.upper())
+                if price:
+                    return str(price)
+            
+            return jsonify({'error': f'No data for {symbol.upper()}'}), 404
+    
+    except Exception as e:
+        logger.error(f"Error getting live quote for {symbol}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/quote/<symbol>/<date>')
+def get_quote_by_date_endpoint(symbol, date):
+    """Get quote for specific date"""
+    return get_quote_helper(symbol.upper(), date=date, field='close')
+
+@app.route('/quote/<symbol>/field/<field>')
+def get_quote_by_field_endpoint(symbol, field):
+    """Get latest value for specific field"""
+    valid_fields = ['open', 'high', 'low', 'close', 'volume']
+    if field.lower() not in valid_fields:
+        return jsonify({'error': f'Invalid field. Must be one of: {", ".join(valid_fields)}'}), 400
+    return get_quote_helper(symbol.upper(), field=field.lower())
+
+@app.route('/latest_date/<symbol>')
+def get_latest_date_endpoint(symbol):
+    """Get most recent date for symbol"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT MAX(quote_date) as latest
+            FROM daily_quotes
+            WHERE symbol = ?
+        ''', (symbol.upper(),))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result and result['latest']:
+            return str(result['latest'])
+        else:
+            # Try auto-fetch
+            if auto_fetch_symbol(symbol.upper()):
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT MAX(quote_date) as latest
+                    FROM daily_quotes
+                    WHERE symbol = ?
+                ''', (symbol.upper(),))
+                result = cursor.fetchone()
+                conn.close()
+                
+                if result and result['latest']:
+                    return str(result['latest'])
+            
+            return jsonify({'error': f'No data for {symbol.upper()}'}), 404
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def get_quote_helper(symbol, date=None, field='close'):
+    """Helper function to get quote data"""
+    try:
+        if not os.path.exists(DB_PATH):
+            return jsonify({'error': 'Database not found'}), 500
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Validate field
+        valid_fields = ['open', 'high', 'low', 'close', 'volume']
+        if field not in valid_fields:
+            field = 'close'
+        
+        if date:
+            # Try exact date first
+            cursor.execute(f'''
+                SELECT {field}
+                FROM daily_quotes
+                WHERE symbol = ? AND quote_date = ?
+            ''', (symbol, date))
+            
+            result = cursor.fetchone()
+            
+            # If no exact match, find nearest date before
+            if not result or result[field] is None:
+                cursor.execute(f'''
+                    SELECT {field}
+                    FROM daily_quotes
+                    WHERE symbol = ? AND quote_date <= ?
+                    ORDER BY quote_date DESC
+                    LIMIT 1
+                ''', (symbol, date))
+                result = cursor.fetchone()
+        else:
+            # Get most recent
+            cursor.execute(f'''
+                SELECT {field}
+                FROM daily_quotes
+                WHERE symbol = ?
+                ORDER BY quote_date DESC
+                LIMIT 1
+            ''', (symbol,))
+            result = cursor.fetchone()
+        
+        conn.close()
+        
+        if result and result[field] is not None:
+            return str(result[field])
+        else:
+            # Try auto-fetch for unknown symbols
+            if auto_fetch_symbol(symbol):
+                # Retry query after fetch
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute(f'''
+                    SELECT {field}
+                    FROM daily_quotes
+                    WHERE symbol = ?
+                    ORDER BY quote_date DESC
+                    LIMIT 1
+                ''', (symbol,))
+                result = cursor.fetchone()
+                conn.close()
+                
+                if result and result[field] is not None:
+                    return str(result[field])
+            
+            return jsonify({'error': f'No data for {symbol}'}), 404
+    
+    except Exception as e:
+        logger.error(f"Error in get_quote_helper: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# SCHEDULED UPDATES
+# ============================================================================
+
+def scheduled_update():
+    """Function called by scheduler for automatic updates"""
+    logger.info("Starting scheduled update")
+    update_all_symbols()
+    logger.info("Scheduled update complete")
+
+def start_scheduler():
+    """Start background scheduler for automatic updates"""
+    update_time = get_config('update_time') or '15:30'
+    hour, minute = map(int, update_time.split(':'))
+    
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        scheduled_update,
+        'cron',
+        day_of_week='mon-fri',
+        hour=hour,
+        minute=minute
+    )
+    scheduler.start()
+    
+    logger.info(f"Scheduler started: updates at {update_time} Mon-Fri")
+    print(f"Automatic updates scheduled for {update_time} Mon-Fri")
+    
+    return scheduler
+
+# ============================================================================
+# COMMAND LINE INTERFACE
+# ============================================================================
+
+def main():
+    global DB_PATH
+    
+    parser = argparse.ArgumentParser(description='Stock Quote Management System')
+    
+    # Database
+    parser.add_argument('--db', type=str, help='Database file path')
+    
+    # Server
+    parser.add_argument('--server', action='store_true', help='Run web server')
+    
+    # Symbol management
+    parser.add_argument('--init', action='store_true', help='Initialize database')
+    parser.add_argument('--add', action='append', help='Add symbol(s) - can use multiple times')
+    parser.add_argument('--remove', type=str, help='Remove symbol')
+    
+    # Updates
+    parser.add_argument('--update', action='store_true', help='Update all symbols')
+    parser.add_argument('--years', type=int, help='Years of history to fetch (for new symbols)')
+    parser.add_argument('--trigger-update', action='store_true', help='Trigger immediate update')
+    
+    # Configuration
+    parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY')
+    
+    # Info
+    parser.add_argument('--stats', action='store_true', help='Show database statistics')
+    parser.add_argument('--dbpath', action='store_true', help='Show database path')
+    
+    args = parser.parse_args()
+    
+    # Set database path if provided
+    if args.db:
+        DB_PATH = args.db
+    
+    # Handle commands
+    if args.init:
+        setup_database()
+        initialize_default_config()
+        initialize_data_sources()
+        # Add reference symbols
+        add_symbol('QQQ')
+        add_symbol('CSCO')
+        print("Database initialized with reference symbols (QQQ, CSCO)")
+        return
+    
+    if args.add:
+        for symbol in args.add:
+            add_symbol(symbol)
+        return
+    
+    if args.remove:
+        remove_symbol(args.remove)
+        return
+    
+    if args.update or args.trigger_update:
+        update_all_symbols(args.years)
+        return
+    
+    if args.config:
+        if args.config[0] == 'list':
+            config = list_config()
+            print(f"\n{'Key':<30} {'Value':<20} {'Description'}")
+            print('-' * 80)
+            for item in config:
+                print(f"{item['key']:<30} {item['value']:<20} {item['description'] or ''}")
+            print()
+        elif args.config[0] == 'get' and len(args.config) > 1:
+            value = get_config(args.config[1])
+            print(f"{args.config[1]} = {value}")
+        elif args.config[0] == 'set' and len(args.config) > 2:
+            if args.config[1] == 'apikey' and len(args.config) > 3:
+                set_api_key(args.config[2], args.config[3])
+                print(f"API key set for {args.config[2]}")
+            else:
+                set_config(args.config[1], args.config[2])
+                print(f"Config updated: {args.config[1]} = {args.config[2]}")
+        else:
+            print("Usage: --config list | get KEY | set KEY VALUE | set apikey SOURCE KEY")
+        return
+    
+    if args.stats:
+        show_statistics()
+        return
+    
+    if args.dbpath:
+        print(f"Database: {DB_PATH}")
+        return
+    
+    if args.server:
+        # Make sure database exists
+        if not os.path.exists(DB_PATH):
+            print(f"Error: Database not found at {DB_PATH}")
+            print("Run with --init to create database")
+            return
+        
+        # Start scheduler
+        scheduler = start_scheduler()
+        
+        # Start server
+        print("=" * 70)
+        print("Stock Quote Server Starting")
+        print("=" * 70)
+        print(f"Database: {DB_PATH}")
+        print(f"Server: http://localhost:5000")
+        print()
+        print("Test: http://localhost:5000/quote/AAPL")
+        print('Use in Calc: =WEBSERVICE("http://localhost:5000/quote/AAPL")')
+        print()
+        print("Press Ctrl+C to stop")
+        print("=" * 70)
+        
+        try:
+            app.run(host='127.0.0.1', port=5000, debug=False)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            scheduler.shutdown()
+        
+        return
+    
+    # No arguments - show help
+    parser.print_help()
+
+if __name__ == '__main__':
+    main()
