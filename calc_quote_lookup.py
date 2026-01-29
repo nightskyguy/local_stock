@@ -1,28 +1,27 @@
 """
+File: calc_quote_lookup.py
 Alternative LibreOffice Calc Integration (Simpler Method)
-This creates a Python script that Calc can call via SHELL() or macros
-
-For use with LibreOffice Basic macro:
-Function STOCKQUOTE(symbol As String, Optional quoteDate As String, Optional field As String) As Variant
-    Dim cmd As String
-    Dim result As String
-    
-    If IsMissing(quoteDate) Then quoteDate = ""
-    If IsMissing(field) Then field = "close"
-    
-    cmd = "python """ & Environ("USERPROFILE") & "\calc_quote_lookup.py"" " & symbol & " " & quoteDate & " " & field
-    result = Trim(CreateUnoService("com.sun.star.system.SystemShellExecute").execute(cmd, "", 1))
-    
-    STOCKQUOTE = CDbl(result)
-End Function
+This Python script is called from a LibreOffice Basic macro.
+See README.md for the Basic macro code.
 """
 
 import sqlite3
 import sys
 import os
+import logging
 from datetime import datetime, timedelta
 
-DB_PATH = os.path.join(os.path.expanduser('~'), 'stock_quotes.db')
+# Use USERPROFILE environment variable instead of expanduser
+# Set up logging
+log_path = os.path.join(os.environ['USERPROFILE'], 'calc_quote_lookup.log')
+logging.basicConfig(
+    filename=log_path,
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+DB_PATH = os.path.join(os.environ['USERPROFILE'], 'stock_quotes.db')
 
 def get_quote_simple(symbol, date='', field='close'):
     """
@@ -30,6 +29,9 @@ def get_quote_simple(symbol, date='', field='close'):
     Returns just the value for easy parsing
     """
     try:
+        logger.info(f"get_quote_simple called: symbol={symbol}, date={date}, field={field}")
+        logger.info(f"DB_PATH={DB_PATH}, exists={os.path.exists(DB_PATH)}")
+        
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
@@ -39,12 +41,14 @@ def get_quote_simple(symbol, date='', field='close'):
             field = 'close'
         
         if date:
+            logger.debug(f"Querying with date: {date}")
             cursor.execute(f'''
                 SELECT {field}
                 FROM daily_quotes
                 WHERE symbol = ? AND quote_date = ?
             ''', (symbol.upper(), date))
         else:
+            logger.debug(f"Querying latest quote")
             cursor.execute(f'''
                 SELECT {field}
                 FROM daily_quotes
@@ -54,26 +58,31 @@ def get_quote_simple(symbol, date='', field='close'):
             ''', (symbol.upper(),))
         
         result = cursor.fetchone()
+        logger.debug(f"Query result: {result}")
         conn.close()
         
         if result and result[0] is not None:
+            logger.info(f"Success: returning {result[0]}")
             print(result[0])
             return 0
         else:
             # Try to fetch if missing
+            logger.warning(f"No data found, attempting auto-fetch")
             auto_fetch(symbol)
             print('ERROR: No data')
             return 1
     
     except Exception as e:
+        logger.error(f"Exception in get_quote_simple: {e}", exc_info=True)
         print(f'ERROR: {e}')
         return 1
 
 def auto_fetch(symbol):
     """Automatically fetch missing data"""
     try:
+        logger.info(f"auto_fetch called for {symbol}")
         # Import here to avoid issues if module not available
-        sys.path.insert(0, os.path.expanduser('~'))
+        sys.path.insert(0, os.environ['USERPROFILE'])
         from stock_fetcher import StockDataFetcher
         
         fetcher = StockDataFetcher()
@@ -81,12 +90,18 @@ def auto_fetch(symbol):
         
         quotes = fetcher.fetch_data(symbol.upper(), start_date)
         if quotes:
+            logger.info(f"auto_fetch: fetched {len(quotes)} quotes")
             fetcher.save_quotes(quotes)
             fetcher.update_symbol_tracking(symbol.upper())
+        else:
+            logger.warning(f"auto_fetch: no quotes returned")
     except Exception as e:
+        logger.error(f"auto_fetch failed: {e}", exc_info=True)
         pass  # Silently fail on auto-fetch
 
 if __name__ == '__main__':
+    logger.info(f"Script started with args: {sys.argv}")
+    
     if len(sys.argv) < 2:
         print('Usage: python calc_quote_lookup.py SYMBOL [DATE] [FIELD]')
         sys.exit(1)
@@ -95,4 +110,6 @@ if __name__ == '__main__':
     date = sys.argv[2] if len(sys.argv) > 2 else ''
     field = sys.argv[3] if len(sys.argv) > 3 else 'close'
     
-    sys.exit(get_quote_simple(symbol, date, field))
+    exit_code = get_quote_simple(symbol, date, field)
+    logger.info(f"Script exiting with code: {exit_code}")
+    sys.exit(exit_code)
