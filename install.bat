@@ -22,7 +22,7 @@ python -m pip install flask apscheduler yfinance pandas numpy
 
 echo.
 echo [2/3] Setting up portfolio...
-call setup_portfolio.bat
+call setup.bat
 
 echo.
 echo [3/3] Starting server...
@@ -53,4 +53,4 @@ echo To configure:
 echo   python stock_system.py --config list
 echo   python stock_system.py --config set update_time "17:30"
 echo.
-pause
+timeout /t 15 /nobreak >nul

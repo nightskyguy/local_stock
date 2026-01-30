@@ -13,7 +13,7 @@ python stock_system.py --init
 
 echo.
 echo [2/3] Adding portfolio symbols...
-python stock_system.py --add AAPL --add TSLA --add IVV --add VOO --add VTI --add VIOO --add IBIT --add FNILX --add SCHD --add EFA --add VWO --add VWEHX --add FZROX --add CSOAX --add SIYYX --add STAYX --add SUSYX --add VASGX --add BND --add BOXX --add HYDB --add HYGH
+python stock_system.py --add AAPL --add TSLA --add IVV --add VOO --add VTI --add VIOO --add IBIT --add FNILX --add SCHD --add EFA --add VWO --add VWEHX --add FZROX --add CSOAX --add SIYYX --add STAYX --add SUSYX --add VASGX --add BND --add BOXX --add HYDB --add HYGH --add MSFT --add NVDA
 
 echo.
 echo [3/3] Fetching 3 years of historical data...
@@ -25,7 +25,7 @@ echo ============================================================
 echo Portfolio Setup Complete!
 echo ============================================================
 echo.
-echo Your portfolio contains 24 symbols plus 2 reference symbols (QQQ, CSCO)
+echo Your portfolio contains 26 symbols; 2 are reference symbols (QQQ, CSCO)
 echo.
 echo To start the server:
 echo   start_server.bat
@@ -33,4 +33,4 @@ echo.
 echo To update daily:
 echo   python stock_system.py --update
 echo.
-pause
+timeout /t 15 /nobreak >nul

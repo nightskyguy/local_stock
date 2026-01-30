@@ -54,6 +54,12 @@ import pandas as pd
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 import threading
+import socket
+import atexit
+
+# Get Lock File with PID (if it exists)
+LOCK_FILE = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system.lock')
+SERVER_PORT_FILE = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system.port')
 
 # ============================================================================
 # CONFIGURATION
@@ -525,9 +531,13 @@ def save_quotes(quotes):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ''', (
                 quote['symbol'], quote['quote_date'],
-                quote.get('open'), quote.get('high'), quote.get('low'),
-                quote.get('close'), quote.get('volume', 0),
-                quote.get('dividends', 0), quote.get('stock_splits', 0),
+                round(quote.get('open'), 2) if quote.get('open') is not None else None,
+                round(quote.get('high'), 2) if quote.get('high') is not None else None,
+                round(quote.get('low'), 2) if quote.get('low') is not None else None,
+                round(quote.get('close'), 2) if quote.get('close') is not None else None,
+                int(quote.get('volume', 0)),
+                round(quote.get('dividends', 0), 2),
+                round(quote.get('stock_splits', 0), 4),  # Stock splits can be fractional
                 quote.get('data_source', 'unknown')
             ))
             saved += 1
@@ -780,11 +790,60 @@ def show_statistics():
     
     print(f"{'='*70}\n")
 
+def list_market_closures():
+    """List all detected market closure dates"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT date, confirmed_count
+        FROM market_closures
+        ORDER BY date DESC
+    ''')
+    
+    closures = cursor.fetchall()
+    conn.close()
+    
+    if not closures:
+        print("No market closures detected yet")
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"Detected Market Closures: {len(closures)}")
+    print(f"{'='*60}")
+    print(f"{'Day':<12} {'Date':<15} {'Confirmed By'}")
+    print(f"{'-'*60}")
+    
+    for row in closures:
+        date_str = row['date']
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        day_name = date_obj.strftime('%A')
+        
+        print(f"{day_name:<12} {date_str:<15} {row['confirmed_count']} symbols")
+    
+    print(f"{'='*60}\n")    
+
 # ============================================================================
 # WEB SERVER
 # ============================================================================
 
 app = Flask(__name__)
+
+@app.route('/stopserver', methods=['POST', 'GET'])
+@app.route('/shutdown', methods=['POST', 'GET'])
+def shutdown():
+    """Graceful shutdown endpoint"""
+    logger.info("Shutdown requested via HTTP")
+    
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        # For production servers, signal the scheduler and exit
+        import signal
+        os.kill(os.getpid(), signal.SIGTERM)
+        return jsonify({'message': 'Server shutting down...'})
+    
+    func()
+    return jsonify({'message': 'Server shutting down...'})
 
 @app.route('/')
 def home():
@@ -799,8 +858,10 @@ def home():
         <li><code>/quote/&lt;symbol&gt;/&lt;date&gt;</code> - Price on specific date (YYYY-MM-DD)</li>
         <li><code>/quote/&lt;symbol&gt;/field/&lt;field&gt;</code> - Latest value for field (open, high, low, close, volume)</li>
         <li><code>/latest_date/&lt;symbol&gt;</code> - Most recent date with data</li>
+        <li><code>/closures</code> - List all detected market closure dates</li>
         <li><code>/config</code> - View configuration (read-only)</li>
         <li><code>/health</code> - Server health check</li>
+        <li><code>/shutdown</code> - Stop the server</li>
     </ul>
     <h2>Examples:</h2>
     <ul>
@@ -810,6 +871,7 @@ def home():
         <li><a href="/quote/AAPL/field/high">/quote/AAPL/field/high</a></li>
         <li><a href="/latest_date/AAPL">/latest_date/AAPL</a></li>
         <li><a href="/config">/config</a></li>
+        <li><a href="/closures">/closures</a></li>
     </ul>
     """
 
@@ -996,6 +1058,150 @@ def get_quote_helper(symbol, date=None, field='close'):
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
+# Concurrency / Start/Stop Management
+# ============================================================================
+
+def acquire_server_lock():
+    """
+    Acquire exclusive server lock to prevent multiple instances
+    Returns True if lock acquired, False if another instance is running
+    """
+    try:
+        # Check if lock file exists
+        if os.path.exists(LOCK_FILE):
+            # Try to read PID from lock file
+            with open(LOCK_FILE, 'r') as f:
+                pid = int(f.read().strip())
+            
+            # Check if process is still running
+            try:
+                # On Windows, this will fail if process doesn't exist
+                os.kill(pid, 0)
+                # Process exists
+                logger.warning(f"Server already running (PID: {pid})")
+                print(f"Error: Server is already running (PID: {pid})")
+                print(f"Use 'python stock_system.py --stopserver' to stop it")
+                return False
+            except (OSError, ProcessLookupError):
+                # Process doesn't exist, stale lock file
+                logger.info("Removing stale lock file")
+                os.remove(LOCK_FILE)
+        
+        # Write current PID to lock file
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        
+        # Register cleanup on exit
+        atexit.register(release_server_lock)
+        
+        logger.info(f"Server lock acquired (PID: {os.getpid()})")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error acquiring server lock: {e}")
+        return False
+
+def release_server_lock():
+    """Release server lock on exit"""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            logger.info("Server lock released")
+    except Exception as e:
+        logger.error(f"Error releasing lock: {e}")
+
+def save_server_port(port):
+    """Save server port for stop command"""
+    try:
+        with open(SERVER_PORT_FILE, 'w') as f:
+            f.write(f"{port}\n{os.getpid()}")
+    except Exception as e:
+        logger.error(f"Error saving server port: {e}")
+
+def get_server_info():
+    """Get running server port and PID"""
+    try:
+        if os.path.exists(SERVER_PORT_FILE):
+            with open(SERVER_PORT_FILE, 'r') as f:
+                lines = f.read().strip().split('\n')
+                if len(lines) >= 2:
+                    return int(lines[0]), int(lines[1])
+        return None, None
+    except Exception as e:
+        logger.error(f"Error reading server info: {e}")
+        return None, None
+
+def stop_server():
+    """Stop running server instance"""
+    port, pid = get_server_info()
+    
+    if not pid:
+        print("No server is currently running")
+        logger.info("Stop requested but no server running")
+        return
+    
+    # Check if process exists
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        print("Server process not found (stale PID file)")
+        # Clean up stale files
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+        if os.path.exists(SERVER_PORT_FILE):
+            os.remove(SERVER_PORT_FILE)
+        return
+    
+    print(f"Stopping server (PID: {pid})...")
+    logger.info(f"Stop command issued for server PID: {pid}")
+    
+    try:
+        # Try graceful shutdown via HTTP request
+        if port:
+            try:
+                import urllib.request
+                urllib.request.urlopen(f'http://localhost:{port}/shutdown', timeout=2)
+                print("Server shutdown signal sent")
+            except:
+                pass
+        
+        # Force kill if still running
+        import signal
+        import time
+        
+        # Send SIGTERM (graceful)
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print("Waiting for graceful shutdown...")
+            time.sleep(2)
+        except:
+            pass
+        
+        # Check if still running
+        try:
+            os.kill(pid, 0)
+            # Still running, force kill
+            print("Force stopping server...")
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(1)
+        except (OSError, ProcessLookupError):
+            pass  # Process is gone
+        
+        # Clean up lock files
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+        if os.path.exists(SERVER_PORT_FILE):
+            os.remove(SERVER_PORT_FILE)
+        
+        print("Server stopped")
+        logger.info("Server stopped successfully")
+    
+    except Exception as e:
+        print(f"Error stopping server: {e}")
+        logger.error(f"Error stopping server: {e}")
+
+
+# ============================================================================
 # SCHEDULED UPDATES
 # ============================================================================
 
@@ -1038,7 +1244,8 @@ def main():
     parser.add_argument('--db', type=str, help='Database file path')
     
     # Server
-    parser.add_argument('--server', action='store_true', help='Run web server')
+    parser.add_argument('--shutdown', '--stop', '--stopserver', action='store_true', help='Stop running server instance')
+    parser.add_argument('--server', '--start', '--startserver', action='store_true', help='Run web server')
     
     # Symbol management
     parser.add_argument('--init', action='store_true', help='Initialize database')
@@ -1054,8 +1261,9 @@ def main():
     parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY')
     
     # Info
-    parser.add_argument('--stats', action='store_true', help='Show database statistics')
+    parser.add_argument('--stats', '--statistics', action='store_true', help='Show database statistics')
     parser.add_argument('--dbpath', action='store_true', help='Show database path')
+    parser.add_argument('--closures', action='store_true', help='List all market closure dates')
     
     args = parser.parse_args()
     
@@ -1063,6 +1271,11 @@ def main():
     if args.db:
         DB_PATH = args.db
     
+    # Handle --stopserver FIRST (before other commands)
+    if args.shutdown:
+        stop_server()
+        return
+
     # Handle commands
     if args.init:
         setup_database()
@@ -1112,7 +1325,11 @@ def main():
     if args.stats:
         show_statistics()
         return
-    
+
+    if args.closures:
+        list_market_closures()
+        return
+        
     if args.dbpath:
         print(f"Database: {DB_PATH}")
         return
@@ -1124,6 +1341,13 @@ def main():
             print("Run with --init to create database")
             return
         
+        # Acquire server lock (prevent multiple instances)
+        if not acquire_server_lock():
+            return
+
+        # Save server info for stop command
+        save_server_port(5000)
+        
         # Start scheduler
         scheduler = start_scheduler()
         
@@ -1133,11 +1357,13 @@ def main():
         print("=" * 70)
         print(f"Database: {DB_PATH}")
         print(f"Server: http://localhost:5000")
+        print(f"PID: {os.getpid()}")
         print()
         print("Test: http://localhost:5000/quote/AAPL")
         print('Use in Calc: =WEBSERVICE("http://localhost:5000/quote/AAPL")')
         print()
-        print("Press Ctrl+C to stop")
+        print("To stop: 'python stock_system.py --stopserver' or 'stop_server.bat'")
+        print("Or press Ctrl+C")
         print("=" * 70)
         
         try:
