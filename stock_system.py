@@ -29,7 +29,6 @@ Usage:
     python stock_system.py --config list
     python stock_system.py --config set KEY VALUE
     python stock_system.py --config set apikey SOURCE KEY
-    python stock_system.py --config priority SOURCE RANK
     
     # Info
     python stock_system.py --stats
@@ -253,34 +252,19 @@ def set_config(key, value):
     logger.info(f"Config updated: {key} = {value}")
 
 def list_config():
-    """List all configuration including data sources"""
+    """List all configuration"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Get config table
     cursor.execute('SELECT key, value, description FROM config ORDER BY key')
-    config_results = cursor.fetchall()
-    
-    # Get data sources table
-    cursor.execute('''
-        SELECT source_name, api_key, rate_limit, priority, enabled, notes 
-        FROM data_sources 
-        ORDER BY priority ASC
-    ''')
-    sources_results = cursor.fetchall()
-    
+    results = cursor.fetchall()
     conn.close()
-    
-    return {
-        'config': config_results,
-        'data_sources': sources_results
-    }
+    return results
 
 def set_source_priority(source, priority):
     """Set data source priority """
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('UPDATE data_sources SET priority = ? WHERE source_name = ?', (priority, source))
+    cursor.execute('UPDATE data_sources SET priority = ? WHERE source_name = ?', (source, priority))
     conn.commit()
     conn.close()
 
@@ -459,11 +443,7 @@ def fetch_yfinance(symbol, start_date, end_date):
     """Fetch data from Yahoo Finance via yfinance"""
     try:
         ticker = yf.Ticker(symbol)
-        # yfinance end date is EXCLUSIVE - add 1 day to include end_date
-        end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)
-        end_date_inclusive = end_dt.strftime('%Y-%m-%d')
-        
-        df = ticker.history(start=start_date, end=end_date_inclusive)        
+        df = ticker.history(start=start_date, end=end_date)
         
         if df.empty:
             return None
@@ -719,8 +699,9 @@ def fetch_finnhub(symbol, start_date, end_date, api_key):
         logger.info(f"Fetching {symbol} from Finnhub")
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
+        
         data = response.json()
-       
+        
         # Check for errors
         if 's' not in data:
             logger.error(f"Finnhub: unexpected response format for {symbol}")
@@ -777,13 +758,7 @@ def fetch_finnhub(symbol, start_date, end_date, api_key):
             logger.info(f"Finnhub: retrieved {len(quotes)} quotes for {symbol}")
         
         return quotes if quotes else None
-
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 403:
-            logger.info(f"Finnhub: {symbol} not available (possibly mutual fund)")
-        else:
-            logger.error(f"Finnhub HTTP error for {symbol}: {e}")
-        return None
+    
     except requests.exceptions.RequestException as e:
         logger.error(f"Finnhub request error for {symbol}: {e}")
         return None
@@ -1567,7 +1542,7 @@ def main():
     parser.add_argument('--trigger-update', action='store_true', help='Trigger immediate update')
     
     # Configuration
-    parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY, set priority SOURCE RANK')
+    parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY')
     
     # Info
     parser.add_argument('--stats', '--statistics', action='store_true', help='Show database statistics')
@@ -1611,43 +1586,29 @@ def main():
     
     if args.config:
         if args.config[0] == 'list':
-            all_config = list_config()
-            
-            # Show config table
-            print(f"{'='*80}")
-            print(f"{'Configuration Key':<30} {'Value':<20} {'Description'}")
+            config = list_config()
+            print(f"\n{'Key':<30} {'Value':<20} {'Description'}")
             print('-' * 80)
-            for item in all_config['config']:
+            for item in config:
                 print(f"{item['key']:<30} {item['value']:<20} {item['description'] or ''}")
-            
-            # Show data sources table
-            print(f"{'='*80}")
-            print(f"{'Source':<15} {'Priority':<10} {'Enabled':<10} {'API Key':<15} {'Rate Limit':<12} {'Notes'}")
-            print('-' * 80)
-            for item in all_config['data_sources']:
-                api_key_display = "Set" if item['api_key'] else "Not Set"
-                enabled_display = "Yes" if item['enabled'] else "No"
-                print(f"{item['source_name']:<15} {item['priority']:<10} {enabled_display:<10} {api_key_display:<15} {item['rate_limit']:<12} {item['notes'] or ''}")
-            print(f"{'='*80}\n")
-            return
-
+            print()
         elif args.config[0] == 'get' and len(args.config) > 1:
             value = get_config(args.config[1])
             print(f"{args.config[1]} = {value}")
-        elif args.config[0] == 'set' and len(args.config) > 2:       
+        elif args.config[0] == 'set' and len(args.config) > 2:
             if args.config[1] == 'apikey' and len(args.config) > 3:
                 set_api_key(args.config[2], args.config[3])
                 print(f"API key set for {args.config[2]}")
-            elif args.config[1] == 'priority' and len(args.config) > 3:
-                set_source_priority(args.config[2], args.config[3])
+            elif args.config[1] == 'priority':
+                set_source_priority(args.config[2], args.config[3]])
                 print(f"Priority updated: {args.config[2]} = {args.config[3]}")
                 logger.info(f"Priority updated: {args.config[2]} = {args.config[3]}")
             else:
                 # TODO This seems useless now.
-                # set_config(args.config[1], args.config[2])
-                print(f"Do not know what '{args.config[1]} {args.config[2]}' means. Ignoring.")
+                set_config(args.config[1], args.config[2])
+                print(f"Config updated: {args.config[1]} = {args.config[2]}")
         else:
-            print("Usage: --config list | get KEY | set apikey SOURCE KEY | set priority SOURCE RANK")
+            print("Usage: --config list | get KEY | set KEY VALUE | set apikey SOURCE KEY | set priority SOURCE RANK")
         return
     
     if args.stats:
