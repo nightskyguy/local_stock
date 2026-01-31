@@ -29,6 +29,7 @@ Usage:
     python stock_system.py --config list
     python stock_system.py --config set KEY VALUE
     python stock_system.py --config set apikey SOURCE KEY
+    python stock_system.py --config priority SOURCE RANK
     
     # Info
     python stock_system.py --stats
@@ -71,20 +72,24 @@ LOG_PATH = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 
 # Reference symbols for market closure detection (must have 4+ years of data)
 REFERENCE_SYMBOLS = ['QQQ', 'CSCO']
 
+# Holidays from finnhub
+MARKET_CLOSURES = [{'eventName': 'Christmas', 'atDate': '2027-12-24', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2027-11-26', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2027-11-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2027-09-06', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2027-07-05', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2027-06-18', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2027-05-31', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2027-03-26', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2027-02-15', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2027-01-18', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2027-01-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2026-12-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2026-12-24', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2026-11-27', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2026-11-26', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2026-09-07', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2026-07-03', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2026-06-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2026-05-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2026-04-03', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2026-02-16', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2026-01-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2026-01-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2025-12-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2025-12-24', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2025-11-28', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2025-11-27', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2025-09-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2025-07-04', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2025-07-03', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2025-06-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2025-05-26', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2025-04-18', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2025-02-17', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2025-01-20', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'National Mourning Day', 'atDate': '2025-01-09', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2025-01-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2024-12-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2024-12-24', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2024-11-29', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2024-11-28', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2024-09-02', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2024-07-04', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2024-07-03', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2024-06-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2024-05-27', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2024-03-29', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2024-02-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2024-01-15', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2024-01-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas Day', 'atDate': '2023-12-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2023-11-24', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2023-11-23', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2023-09-04', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2023-07-04', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2023-07-03', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2023-06-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2023-05-29', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2023-04-07', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2023-02-20', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2023-01-16', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2023-01-02', 'tradingHour': '', 'postMarket': ''}]
+
+
 # Default configuration values
 DEFAULT_CONFIG = {
-    'update_time': '15:30',           # 3:30 PM local time
+    'update_time': '18:30',           # 6:30 PM local time
     'cache_duration': '900',          # 15 minutes in seconds
     'default_years': '3',             # Default history to fetch
     'apikey_alphavantage': '',
     'apikey_fmp': '',
     'apikey_finnhub': '',
-    'active_source': 'yfinance',
-    'source_priority_1': 'yfinance',
-    'source_priority_2': 'alphavantage',
-    'source_priority_3': 'fmp',
-    'source_priority_4': 'finnhub',
 }
+
+# For rate limiting alphavantage
+_last_alphavantage_call = 0
+_alphavantage_delay = 12  # 12 seconds = 5 calls per minute (safe for free tier)
+
 
 # Setup logging
 logging.basicConfig(
@@ -207,9 +212,9 @@ def initialize_data_sources():
     
     sources = [
         ('yfinance', '', 2000, 1, 1, 'Yahoo Finance via yfinance - Free, no API key'),
-        ('alphavantage', '', 25, 0, 2, 'Alpha Vantage - Free tier: 25 req/day'),
-        ('fmp', '', 250, 0, 3, 'Financial Modeling Prep - Free tier: 250 req/day'),
-        ('finnhub', '', 60, 0, 4, 'Finnhub - Free tier: 60 calls/min'),
+        ('finnhub', '', 60, 0, 2, 'Finnhub - Free tier: 60 calls/min'),
+        ('alphavantage', '', 25, 0, 3, 'Alpha Vantage - Free tier: 25 req/day'),
+        ('fmp', '', 250, 0, 4, 'Financial Modeling Prep - Free tier: 250 req/day'),
     ]
     
     for source in sources:
@@ -248,13 +253,36 @@ def set_config(key, value):
     logger.info(f"Config updated: {key} = {value}")
 
 def list_config():
-    """List all configuration"""
+    """List all configuration including data sources"""
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # Get config table
     cursor.execute('SELECT key, value, description FROM config ORDER BY key')
-    results = cursor.fetchall()
+    config_results = cursor.fetchall()
+    
+    # Get data sources table
+    cursor.execute('''
+        SELECT source_name, api_key, rate_limit, priority, enabled, notes 
+        FROM data_sources 
+        ORDER BY priority ASC
+    ''')
+    sources_results = cursor.fetchall()
+    
     conn.close()
-    return results
+    
+    return {
+        'config': config_results,
+        'data_sources': sources_results
+    }
+
+def set_source_priority(source, priority):
+    """Set data source priority """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE data_sources SET priority = ? WHERE source_name = ?', (priority, source))
+    conn.commit()
+    conn.close()
 
 def set_api_key(source, key):
     """Set API key for data source"""
@@ -309,11 +337,11 @@ def remove_symbol(symbol):
     cursor.execute('SELECT COUNT(*) as count FROM daily_quotes WHERE symbol = ?', (symbol.upper(),))
     quote_count = cursor.fetchone()['count']
     
-    response = input(f"Delete {symbol.upper()} and {quote_count} quotes? (yes/no): ")
-    if response.lower() != 'yes':
-        print("Cancelled")
-        conn.close()
-        return
+    #// response = input(f"Delete {symbol.upper()} and {quote_count} quotes? (yes/no): ")
+    #// if response.lower() != 'yes':
+    #//     print("Cancelled")
+    #//     conn.close()
+    #//    return
     
     # Delete data
     cursor.execute('DELETE FROM daily_quotes WHERE symbol = ?', (symbol.upper(),))
@@ -360,13 +388,30 @@ def update_symbol_tracking(symbol):
 # ============================================================================
 
 def get_market_closures():
-    """Get set of known market closure dates"""
+    """Get list of known market closure dates with metadata"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT date FROM market_closures')
-    closures = {row['date'] for row in cursor.fetchall()}
+    cursor.execute('''
+        SELECT date
+        FROM market_closures
+        ORDER BY date DESC
+    ''')
+    closures = cursor.fetchall()
     conn.close()
-    return closures
+    
+    # Format with day names
+    result = []
+    for row in closures:
+        date_str = row['date']
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        day_name = date_obj.strftime('%A')
+        
+        result.append({
+            'day': day_name,
+            'date': date_str
+        })
+    
+    return result
 
 def mark_market_closure(date):
     """Mark a date as market closure"""
@@ -385,7 +430,6 @@ def detect_market_closures(symbol, failed_dates):
     Detect market closures based on failed fetch attempts
     Mark as closure if:
     - Symbol is a reference symbol (QQQ or CSCO) and fetch failed
-    - 4+ regular symbols failed on same date
     """
     if not failed_dates:
         return
@@ -404,33 +448,7 @@ def detect_market_closures(symbol, failed_dates):
         if is_reference:
             # Reference symbol failed - mark immediately
             mark_market_closure(date_str)
-        else:
-            # Count how many symbols failed on this date
-            # We track this by seeing how many symbols have NO data for this date
-            # but DO have data before and after it
-            cursor.execute('''
-                SELECT COUNT(DISTINCT s.symbol) as count
-                FROM symbols s
-                WHERE s.active = 1
-                AND EXISTS (
-                    SELECT 1 FROM daily_quotes dq1
-                    WHERE dq1.symbol = s.symbol AND dq1.quote_date < ?
-                )
-                AND EXISTS (
-                    SELECT 1 FROM daily_quotes dq2
-                    WHERE dq2.symbol = s.symbol AND dq2.quote_date > ?
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM daily_quotes dq3
-                    WHERE dq3.symbol = s.symbol AND dq3.quote_date = ?
-                )
-            ''', (date_str, date_str, date_str))
-            
-            failed_count = cursor.fetchone()['count']
-            
-            if failed_count >= 4:
-                mark_market_closure(date_str)
-    
+
     conn.close()
 
 # ============================================================================
@@ -441,7 +459,11 @@ def fetch_yfinance(symbol, start_date, end_date):
     """Fetch data from Yahoo Finance via yfinance"""
     try:
         ticker = yf.Ticker(symbol)
-        df = ticker.history(start=start_date, end=end_date)
+        # yfinance end date is EXCLUSIVE - add 1 day to include end_date
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)
+        end_date_inclusive = end_dt.strftime('%Y-%m-%d')
+        
+        df = ticker.history(start=start_date, end=end_date_inclusive)        
         
         if df.empty:
             return None
@@ -485,13 +507,26 @@ def fetch_live_quote_yfinance(symbol):
         return None
 
 def get_enabled_sources():
-    """Get list of enabled data sources in priority order"""
+    """
+    Get list of data sources in priority order that are ready to use.
+    
+    Returns sources that either:
+    - Don't require an API key (yfinance), OR
+    - Have an API key configured
+    
+    This eliminates the need for a separate 'enabled' flag - sources are
+    automatically enabled when they have a key.
+    
+    Returns:
+        List of tuples: [(source_name, api_key), ...]
+    """
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT source_name, api_key
+        SELECT source_name, api_key, rate_limit
         FROM data_sources
-        WHERE enabled = 1
+        WHERE source_name = 'yfinance' 
+           OR (api_key IS NOT NULL AND api_key != '')
         ORDER BY priority ASC
     ''')
     sources = cursor.fetchall()
@@ -502,17 +537,259 @@ def fetch_data_multi_source(symbol, start_date, end_date):
     """Fetch data trying multiple sources with fallback"""
     sources = get_enabled_sources()
     
+    if not sources:
+        logger.error("No enabled data sources configured")
+        return None
+    
     for source_name, api_key in sources:
         logger.info(f"Trying {source_name} for {symbol}")
         
-        if source_name == 'yfinance':
-            quotes = fetch_yfinance(symbol, start_date, end_date)
-            if quotes:
-                return quotes
-        # Add other sources here (alphavantage, fmp, finnhub) as needed
+        try:
+            if source_name == 'yfinance':
+                quotes = fetch_yfinance(symbol, start_date, end_date)
+                if quotes:
+                    logger.info(f"Successfully fetched {len(quotes)} quotes from {source_name}")
+                    return quotes
+                    
+            elif source_name == 'alphavantage':
+                if not api_key:
+                    logger.warning(f"Skipping {source_name}: no API key configured")
+                    continue
+                quotes = fetch_alphavantage(symbol, start_date, end_date, api_key)
+                if quotes:
+                    logger.info(f"Successfully fetched {len(quotes)} quotes from {source_name}")
+                    return quotes
+                    
+            elif source_name == 'fmp':
+                if not api_key:
+                    logger.warning(f"Skipping {source_name}: no API key configured")
+                    continue
+                quotes = fetch_fmp(symbol, start_date, end_date, api_key)
+                if quotes:
+                    logger.info(f"Successfully fetched {len(quotes)} quotes from {source_name}")
+                    return quotes
+                    
+            elif source_name == 'finnhub':
+                if not api_key:
+                    logger.warning(f"Skipping {source_name}: no API key configured")
+                    continue
+                quotes = fetch_finnhub(symbol, start_date, end_date, api_key)
+                if quotes:
+                    logger.info(f"Successfully fetched {len(quotes)} quotes from {source_name}")
+                    return quotes
+                    
+            else:
+                logger.warning(f"Unknown source: {source_name}")
+                
+        except Exception as e:
+            logger.error(f"Error with {source_name} for {symbol}: {e}")
+            continue  # Try next source
     
-    logger.error(f"All sources failed for {symbol}")
+    logger.error(f"All enabled sources failed for {symbol}")
     return None
+
+
+def fetch_alphavantage(symbol, start_date, end_date, api_key):
+    """Fetch data from Alpha Vantage with rate limiting"""
+    global _last_alphavantage_call
+    
+    try:
+        import requests
+        from datetime import datetime
+        
+        # Rate limiting: ensure at least 12 seconds between calls
+        now = time.time()
+        time_since_last = now - _last_alphavantage_call
+        if time_since_last < _alphavantage_delay:
+            sleep_time = _alphavantage_delay - time_since_last
+            logger.info(f"Alpha Vantage rate limit: sleeping {sleep_time:.1f}s")
+            time.sleep(sleep_time)
+        
+        _last_alphavantage_call = time.time()
+        
+        # Alpha Vantage TIME_SERIES_DAILY endpoint
+        url = 'https://www.alphavantage.co/query'
+        params = {
+            'function': 'TIME_SERIES_DAILY',
+            'symbol': symbol,
+            'apikey': api_key,
+            'outputsize': 'compact',
+            'datatype': 'json'
+        }
+        
+        logger.info(f"Fetching {symbol} from Alpha Vantage")
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Check for error messages
+        if 'Error Message' in data:
+            logger.error(f"Alpha Vantage error: {data['Error Message']}")
+            return None
+        
+        if 'Note' in data:
+            # Daily rate limit hit (25 requests/day)
+            logger.warning(f"Alpha Vantage daily rate limit hit")
+            return None
+        
+        if 'Information' in data:
+            # Burst rate limit message
+            logger.warning(f"Alpha Vantage burst rate limit (ignoring - we have rate limiting)")
+            # Don't return None here - might still have data
+        
+        if 'Time Series (Daily)' not in data:
+            logger.error(f"Alpha Vantage: no time series data for {symbol}")
+            return None
+        
+        time_series = data['Time Series (Daily)']
+        
+        # Filter by date range
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d').date()
+        
+        quotes = []
+        for date_str, daily_data in time_series.items():
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+            
+            if start_dt <= date_obj <= end_dt:
+                try:
+                    quotes.append({
+                        'symbol': symbol,
+                        'quote_date': date_str,
+                        'open': round(float(daily_data['1. open']), 2),
+                        'high': round(float(daily_data['2. high']), 2),
+                        'low': round(float(daily_data['3. low']), 2),
+                        'close': round(float(daily_data['4. close']), 2),
+                        'volume': int(float(daily_data['5. volume'])),
+                        'dividends': 0,
+                        'stock_splits': 0,
+                        'data_source': 'alphavantage'
+                    })
+                except (KeyError, ValueError) as e:
+                    logger.warning(f"Skipping {date_str} for {symbol}: {e}")
+                    continue
+        
+        if quotes:
+            quotes.sort(key=lambda x: x['quote_date'])
+            logger.info(f"Alpha Vantage: retrieved {len(quotes)} quotes for {symbol}")
+        
+        return quotes if quotes else None
+    
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Alpha Vantage request error for {symbol}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Alpha Vantage error for {symbol}: {e}")
+        return None
+
+
+# ////////////////////
+
+def fetch_fmp(symbol, start_date, end_date, api_key):
+    """Fetch data from Financial Modeling Prep"""
+    # TODO: Implement FMP fetching
+    logger.warning("FMP fetching not yet implemented")
+    return None
+
+
+def fetch_finnhub(symbol, start_date, end_date, api_key):
+    """Fetch data from Finnhub"""
+    try:
+        import requests
+        from datetime import datetime
+        
+        # Convert dates to Unix timestamps (Finnhub requires this)
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        
+        start_timestamp = int(start_dt.timestamp())
+        end_timestamp = int(end_dt.timestamp())
+        
+        # Finnhub stock candles endpoint
+        url = 'https://finnhub.io/api/v1/stock/candle'
+        params = {
+            'symbol': symbol,
+            'resolution': 'D',  # Daily data
+            'from': start_timestamp,
+            'to': end_timestamp,
+            'token': api_key
+        }
+        
+        logger.info(f"Fetching {symbol} from Finnhub")
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+       
+        # Check for errors
+        if 's' not in data:
+            logger.error(f"Finnhub: unexpected response format for {symbol}")
+            logger.debug(f"Response: {data}")
+            return None
+        
+        # Check status
+        if data['s'] == 'no_data':
+            logger.warning(f"Finnhub: no data available for {symbol}")
+            return None
+        
+        if data['s'] != 'ok':
+            logger.error(f"Finnhub error status: {data['s']}")
+            return None
+        
+        # Finnhub returns parallel arrays
+        timestamps = data.get('t', [])
+        opens = data.get('o', [])
+        highs = data.get('h', [])
+        lows = data.get('l', [])
+        closes = data.get('c', [])
+        volumes = data.get('v', [])
+        
+        if not timestamps:
+            logger.warning(f"Finnhub: empty data for {symbol}")
+            return None
+        
+        # Convert to our quote format
+        quotes = []
+        for i in range(len(timestamps)):
+            try:
+                # Convert Unix timestamp to date string
+                date_obj = datetime.fromtimestamp(timestamps[i])
+                date_str = date_obj.strftime('%Y-%m-%d')
+                
+                quotes.append({
+                    'symbol': symbol,
+                    'quote_date': date_str,
+                    'open': round(opens[i], 2) if i < len(opens) else None,
+                    'high': round(highs[i], 2) if i < len(highs) else None,
+                    'low': round(lows[i], 2) if i < len(lows) else None,
+                    'close': round(closes[i], 2) if i < len(closes) else None,
+                    'volume': int(volumes[i]) if i < len(volumes) else 0,
+                    'dividends': 0,  # Finnhub doesn't include dividends in candle data
+                    'stock_splits': 0,
+                    'data_source': 'finnhub'
+                })
+            except (IndexError, ValueError, OSError) as e:
+                logger.warning(f"Skipping timestamp {timestamps[i]} for {symbol}: {e}")
+                continue
+        
+        if quotes:
+            quotes.sort(key=lambda x: x['quote_date'])
+            logger.info(f"Finnhub: retrieved {len(quotes)} quotes for {symbol}")
+        
+        return quotes if quotes else None
+
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            logger.info(f"Finnhub: {symbol} not available (possibly mutual fund)")
+        else:
+            logger.error(f"Finnhub HTTP error for {symbol}: {e}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Finnhub request error for {symbol}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Finnhub error for {symbol}: {e}")
+        return None
 
 def save_quotes(quotes):
     """Save quotes to database"""
@@ -792,17 +1069,7 @@ def show_statistics():
 
 def list_market_closures():
     """List all detected market closure dates"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT date, confirmed_count
-        FROM market_closures
-        ORDER BY date DESC
-    ''')
-    
-    closures = cursor.fetchall()
-    conn.close()
+    closures = get_market_closures()
     
     if not closures:
         print("No market closures detected yet")
@@ -811,7 +1078,7 @@ def list_market_closures():
     print(f"\n{'='*60}")
     print(f"Detected Market Closures: {len(closures)}")
     print(f"{'='*60}")
-    print(f"{'Day':<12} {'Date':<15} {'Confirmed By'}")
+    print(f"{'Day':<12} {'Date':<15} ")
     print(f"{'-'*60}")
     
     for row in closures:
@@ -819,7 +1086,7 @@ def list_market_closures():
         date_obj = datetime.strptime(date_str, '%Y-%m-%d')
         day_name = date_obj.strftime('%A')
         
-        print(f"{day_name:<12} {date_str:<15} {row['confirmed_count']} symbols")
+        print(f"{day_name:<12} {date_str:<15} ")
     
     print(f"{'='*60}\n")    
 
@@ -829,21 +1096,24 @@ def list_market_closures():
 
 app = Flask(__name__)
 
-@app.route('/stopserver', methods=['POST', 'GET'])
 @app.route('/shutdown', methods=['POST', 'GET'])
+@app.route('/serverstop', methods=['POST', 'GET'])
 def shutdown():
     """Graceful shutdown endpoint"""
     logger.info("Shutdown requested via HTTP")
     
-    func = request.environ.get('werkzeug.server.shutdown')
-    if func is None:
-        # For production servers, signal the scheduler and exit
-        import signal
-        os.kill(os.getpid(), signal.SIGTERM)
-        return jsonify({'message': 'Server shutting down...'})
+    def shutdown_server():
+        # Give time to send response
+        import time
+        time.sleep(1)
+        # Force exit
+        os._exit(0)
     
-    func()
-    return jsonify({'message': 'Server shutting down...'})
+    # Start shutdown in background thread
+    import threading
+    threading.Thread(target=shutdown_server, daemon=True).start()
+    
+    return jsonify({'message': 'Server shutting down...'}), 200
 
 @app.route('/')
 def home():
@@ -871,6 +1141,7 @@ def home():
         <li><a href="/quote/AAPL/field/high">/quote/AAPL/field/high</a></li>
         <li><a href="/latest_date/AAPL">/latest_date/AAPL</a></li>
         <li><a href="/config">/config</a></li>
+        <li><a href="/health">/health</a></li>
         <li><a href="/closures">/closures</a></li>
     </ul>
     """
@@ -886,14 +1157,21 @@ def health():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
         cursor.execute('SELECT COUNT(*) as count FROM daily_quotes')
         quote_count = cursor.fetchone()['count']
+        
+        cursor.execute('SELECT MAX(last_updated) as last_update FROM daily_quotes')
+        last_update = cursor.fetchone()['last_update']
+        
         conn.close()
         
         return jsonify({
             'status': 'ok',
             'database': DB_PATH,
-            'quotes': quote_count
+            'quotes': quote_count,
+            'last_update': last_update,
+            'pid': os.getpid()
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -911,6 +1189,13 @@ def view_config():
 def get_quote_endpoint(symbol):
     """Get latest close price"""
     return get_quote_helper(symbol.upper(), field='close')
+
+
+@app.route('/closures')
+def list_closures():
+    """List market closures"""
+    return jsonify(get_market_closures())
+
 
 @app.route('/quote/<symbol>/now')
 def get_live_quote_endpoint(symbol):
@@ -1061,6 +1346,32 @@ def get_quote_helper(symbol, date=None, field='close'):
 # Concurrency / Start/Stop Management
 # ============================================================================
 
+# Replace the acquire_server_lock() function with this:
+
+def is_process_running(pid):
+    """
+    Check if a process with given PID is running (Windows-compatible)
+    """
+    import platform
+    
+    if platform.system() == 'Windows':
+        # Use tasklist on Windows
+        import subprocess
+        try:
+            output = subprocess.check_output(['tasklist', '/FI', f'PID eq {pid}'], 
+                                           stderr=subprocess.DEVNULL,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
+            return str(pid) in output.decode()
+        except:
+            return False
+    else:
+        # Unix/Linux/Mac
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
 def acquire_server_lock():
     """
     Acquire exclusive server lock to prevent multiple instances
@@ -1073,16 +1384,14 @@ def acquire_server_lock():
             with open(LOCK_FILE, 'r') as f:
                 pid = int(f.read().strip())
             
-            # Check if process is still running
-            try:
-                # On Windows, this will fail if process doesn't exist
-                os.kill(pid, 0)
+            # Check if process is still running (Windows-compatible)
+            if is_process_running(pid):
                 # Process exists
                 logger.warning(f"Server already running (PID: {pid})")
                 print(f"Error: Server is already running (PID: {pid})")
                 print(f"Use 'python stock_system.py --stopserver' to stop it")
                 return False
-            except (OSError, ProcessLookupError):
+            else:
                 # Process doesn't exist, stale lock file
                 logger.info("Removing stale lock file")
                 os.remove(LOCK_FILE)
@@ -1258,7 +1567,7 @@ def main():
     parser.add_argument('--trigger-update', action='store_true', help='Trigger immediate update')
     
     # Configuration
-    parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY')
+    parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY, set priority SOURCE RANK')
     
     # Info
     parser.add_argument('--stats', '--statistics', action='store_true', help='Show database statistics')
@@ -1302,24 +1611,43 @@ def main():
     
     if args.config:
         if args.config[0] == 'list':
-            config = list_config()
-            print(f"\n{'Key':<30} {'Value':<20} {'Description'}")
+            all_config = list_config()
+            
+            # Show config table
+            print(f"{'='*80}")
+            print(f"{'Configuration Key':<30} {'Value':<20} {'Description'}")
             print('-' * 80)
-            for item in config:
+            for item in all_config['config']:
                 print(f"{item['key']:<30} {item['value']:<20} {item['description'] or ''}")
-            print()
+            
+            # Show data sources table
+            print(f"{'='*80}")
+            print(f"{'Source':<15} {'Priority':<10} {'Enabled':<10} {'API Key':<15} {'Rate Limit':<12} {'Notes'}")
+            print('-' * 80)
+            for item in all_config['data_sources']:
+                api_key_display = "Set" if item['api_key'] else "Not Set"
+                enabled_display = "Yes" if item['enabled'] else "No"
+                print(f"{item['source_name']:<15} {item['priority']:<10} {enabled_display:<10} {api_key_display:<15} {item['rate_limit']:<12} {item['notes'] or ''}")
+            print(f"{'='*80}\n")
+            return
+
         elif args.config[0] == 'get' and len(args.config) > 1:
             value = get_config(args.config[1])
             print(f"{args.config[1]} = {value}")
-        elif args.config[0] == 'set' and len(args.config) > 2:
+        elif args.config[0] == 'set' and len(args.config) > 2:       
             if args.config[1] == 'apikey' and len(args.config) > 3:
                 set_api_key(args.config[2], args.config[3])
                 print(f"API key set for {args.config[2]}")
+            elif args.config[1] == 'priority' and len(args.config) > 3:
+                set_source_priority(args.config[2], args.config[3])
+                print(f"Priority updated: {args.config[2]} = {args.config[3]}")
+                logger.info(f"Priority updated: {args.config[2]} = {args.config[3]}")
             else:
-                set_config(args.config[1], args.config[2])
-                print(f"Config updated: {args.config[1]} = {args.config[2]}")
+                # TODO This seems useless now.
+                # set_config(args.config[1], args.config[2])
+                print(f"Do not know what '{args.config[1]} {args.config[2]}' means. Ignoring.")
         else:
-            print("Usage: --config list | get KEY | set KEY VALUE | set apikey SOURCE KEY")
+            print("Usage: --config list | get KEY | set apikey SOURCE KEY | set priority SOURCE RANK")
         return
     
     if args.stats:

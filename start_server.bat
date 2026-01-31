@@ -2,6 +2,9 @@
 REM File: start_server.bat
 REM Start the stock quote web server in background
 
+REM Change to the directory where this batch file is located
+pushd "%~dp0"
+
 echo ============================================================
 echo Starting Stock Quote Server (Background)
 echo ============================================================
@@ -12,7 +15,7 @@ python stock_system.py --server 2>&1 | findstr /C:"already running" >nul
 if %errorlevel% equ 0 (
     echo Server is already running.
     echo To stop: python stock_system.py --stopserver
-    timeout /t 15 /nobreak >nul
+    popd
     exit /b 1
 )
 
@@ -44,4 +47,5 @@ if %errorlevel% equ 0 (
 )
 
 echo Window will close in 15 seconds...
+popd
 timeout /t 15 /nobreak >nul
