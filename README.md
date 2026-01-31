@@ -110,9 +110,7 @@ All configuration is stored in the database:
 | `update_time` | `15:30` | Time for automatic updates (local time, Mon-Fri) |
 | `cache_duration` | `900` | Live quote cache duration in seconds (15 minutes) |
 | `default_years` | `3` | Years of history to fetch for new symbols |
-| `apikey_alphavantage` | `""` | Alpha Vantage API key |
-| `apikey_fmp` | `""` | Financial Modeling Prep API key |
-| `apikey_finnhub` | `""` | Finnhub API key |
+
 
 ## How It Works
 
@@ -262,9 +260,9 @@ python stock_system.py --update --years 5
 # - Finnhub: https://finnhub.io/register
 
 # Configure
+python stock_system.py --config set apikey finnhub YOUR_KEY
 python stock_system.py --config set apikey alphavantage YOUR_KEY
 python stock_system.py --config set apikey fmp YOUR_KEY
-python stock_system.py --config set apikey finnhub YOUR_KEY
 ```
 
 ## Requirements
