@@ -1445,7 +1445,10 @@ def get_server_info():
         return None, None
 
 def stop_server():
-    """Stop running server instance"""
+    """Stop running server instance (cross-platform)"""
+    import platform
+    import subprocess
+    
     port, pid = get_server_info()
     
     if not pid:
@@ -1454,9 +1457,7 @@ def stop_server():
         return
     
     # Check if process exists
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
+    if not is_process_running(pid):
         print("Server process not found (stale PID file)")
         # Clean up stale files
         if os.path.exists(LOCK_FILE):
@@ -1475,30 +1476,26 @@ def stop_server():
                 import urllib.request
                 urllib.request.urlopen(f'http://localhost:{port}/shutdown', timeout=2)
                 print("Server shutdown signal sent")
+                time.sleep(2)
             except:
                 pass
         
-        # Force kill if still running
-        import signal
-        import time
-        
-        # Send SIGTERM (graceful)
-        try:
-            os.kill(pid, signal.SIGTERM)
-            print("Waiting for graceful shutdown...")
-            time.sleep(2)
-        except:
-            pass
-        
-        # Check if still running
-        try:
-            os.kill(pid, 0)
-            # Still running, force kill
+        # Check if still running after graceful attempt
+        if is_process_running(pid):
             print("Force stopping server...")
-            os.kill(pid, signal.SIGKILL)
+            
+            # Platform-specific force kill
+            if platform.system() == 'Windows':
+                # Windows: use taskkill
+                subprocess.run(['taskkill', '/F', '/PID', str(pid)], 
+                             stderr=subprocess.DEVNULL,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                # Unix/Linux/Mac: use kill with SIGKILL
+                import signal
+                os.kill(pid, signal.SIGKILL)
+            
             time.sleep(1)
-        except (OSError, ProcessLookupError):
-            pass  # Process is gone
         
         # Clean up lock files
         if os.path.exists(LOCK_FILE):
