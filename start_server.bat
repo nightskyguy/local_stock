@@ -10,15 +10,6 @@ echo Starting Stock Quote Server (Background)
 echo ============================================================
 echo.
 
-REM Check if server is already running
-python stock_system.py --server 2>&1 | findstr /C:"already running" >nul
-if %errorlevel% equ 0 (
-    echo Server is already running.
-    echo To stop: python stock_system.py --stopserver
-    popd
-    exit /b 1
-)
-
 REM Start server in background (new window, minimized)
 start "Stock Quote Server" /MIN python stock_system.py --server
 

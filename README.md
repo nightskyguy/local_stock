@@ -5,12 +5,12 @@ A unified, self-contained stock quote management system with local database, web
 ## Features
 
 - **Local SQLite database** for historical quotes
-- **Multi-source data fetching** with automatic fallback (yfinance, Alpha Vantage, FMP, Finnhub)
+- **Multi-source data fetching** with automatic fallback (yfinance, Finnhub, Alpha Vantage, FMP)
 - **Web server** for LibreOffice Calc integration via WEBSERVICE()
 - **Live quote caching** (15-minute default)
-- **Automatic daily updates** at scheduled time (3:30 PM default)
-- **Smart incremental updates** (only fetch new dates)
-- **Market closure detection** (no more wasted requests)
+- **Automatic daily updates** at scheduled time (6:30 PM default)
+- **Smart incremental updates** - only fetch new dates
+- **Market closure detection** - no requesting data that corresponds to market closures.
 - **Single command installation**
 - **All-in-one CLI tool** for management
 
@@ -24,8 +24,8 @@ install.bat
 
 This will:
 1. Install Python dependencies (Flask, yfinance, pandas, APScheduler)
-2. Initialize database with a specific portfolio (24 symbols + 2 reference symbols) - see [setup.bat](setup.bat)
-3. Fetch 3 years of historical data
+2. Initialize database with a specific portfolio (and 2 reference symbols) - see [setup.bat](setup.bat)
+3. Fetch and keep 3 years of historical data
 4. Start the web server
 
 ### Using in LibreOffice Calc
@@ -50,16 +50,17 @@ python stock_system.py --server
 # Use custom database location
 python stock_system.py --db C:\path\to\database.db --server
 ```
+Default location is %USERPROFILE%\stock_quotes.db
 
 ### Symbol Management
 ```bash
-# Initialize database (includes QQQ and CSCO reference symbols)
+# Initialize database (includes QQQ and CSCO as reference symbols)
 python stock_system.py --init
 
 # Add symbols (can add multiple at once)
-python stock_system.py --add AAPL --add CSCO --add TSLA
+python stock_system.py --add AAPL --add NVDA --add TSLA
 
-# Remove symbol (with confirmation)
+# Remove symbol (no confirmation - be careful!)
 python stock_system.py --remove FISOX
 ```
 
@@ -70,17 +71,14 @@ python stock_system.py --update
 
 # Update with specific history for new symbols
 python stock_system.py --update --years 5
-
-# Force immediate update (even if server is running)
-python stock_system.py --trigger-update
 ```
 
 ### Configuration
 ```bash
-# List all configuration
+# List all configuration information
 python stock_system.py --config list
 
-# Get specific value
+# List specific configuration value
 python stock_system.py --config get update_time
 
 # Set configuration
@@ -88,9 +86,10 @@ python stock_system.py --config set update_time "17:30"
 python stock_system.py --config set cache_duration 600
 python stock_system.py --config set default_years 5
 
-# Set API keys
+# Set API keys and fetch priority (lower number is higher priority)
 python stock_system.py --config set apikey alphavantage YOUR_KEY_HERE
 python stock_system.py --config set apikey fmp YOUR_KEY_HERE
+python stock_system.py --config set priority alphavantage 4
 ```
 
 ### Information

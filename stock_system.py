@@ -23,7 +23,6 @@ Usage:
     
     # Updates
     python stock_system.py --update [--years N]
-    python stock_system.py --trigger-update
     
     # Configuration
     python stock_system.py --config list
@@ -179,7 +178,6 @@ def setup_database():
             source_name TEXT PRIMARY KEY,
             api_key TEXT,
             rate_limit INTEGER,
-            enabled INTEGER DEFAULT 1,
             priority INTEGER DEFAULT 99,
             notes TEXT
         )
@@ -218,7 +216,7 @@ def initialize_data_sources():
     
     for source in sources:
         cursor.execute('''
-            INSERT OR IGNORE INTO data_sources (source_name, api_key, rate_limit, enabled, priority, notes)
+            INSERT OR IGNORE INTO data_sources (source_name, api_key, rate_limit, priority, notes)
             VALUES (?, ?, ?, ?, ?, ?)
         ''', source)
     
@@ -252,13 +250,28 @@ def set_config(key, value):
     logger.info(f"Config updated: {key} = {value}")
 
 def list_config():
-    """List all configuration"""
+    """List all configuration including data sources"""
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # Get config table
     cursor.execute('SELECT key, value, description FROM config ORDER BY key')
-    results = cursor.fetchall()
+    config_results = cursor.fetchall()
+    
+    # Get data sources table
+    cursor.execute('''
+        SELECT source_name, api_key, rate_limit, priority 
+        FROM data_sources 
+        ORDER BY priority ASC
+    ''')
+    sources_results = cursor.fetchall()
+    
     conn.close()
-    return results
+    
+    return {
+        'config': config_results,
+        'data_sources': sources_results
+    }
 
 def set_source_priority(source, priority):
     """Set data source priority """
@@ -443,7 +456,12 @@ def fetch_yfinance(symbol, start_date, end_date):
     """Fetch data from Yahoo Finance via yfinance"""
     try:
         ticker = yf.Ticker(symbol)
-        df = ticker.history(start=start_date, end=end_date)
+
+        # yfinance end date is EXCLUSIVE - add 1 day to include end_date
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)
+        end_date_inclusive = end_dt.strftime('%Y-%m-%d')
+        
+        df = ticker.history(start=start_date, end=end_date_inclusive)        
         
         if df.empty:
             return None
@@ -466,7 +484,7 @@ def fetch_yfinance(symbol, start_date, end_date):
         return quotes
     
     except Exception as e:
-        logger.error(f"yfinance fetch failed for {symbol}: {e}")
+        logger.error(f"yfinance: fetch failed for {symbol}: {e}")
         return None
 
 def fetch_live_quote_yfinance(symbol):
@@ -494,9 +512,6 @@ def get_enabled_sources():
     - Don't require an API key (yfinance), OR
     - Have an API key configured
     
-    This eliminates the need for a separate 'enabled' flag - sources are
-    automatically enabled when they have a key.
-    
     Returns:
         List of tuples: [(source_name, api_key), ...]
     """
@@ -506,7 +521,7 @@ def get_enabled_sources():
         SELECT source_name, api_key, rate_limit
         FROM data_sources
         WHERE source_name = 'yfinance' 
-           OR (api_key IS NOT NULL AND api_key != '')
+           OR (api_key IS NOT NULL AND api_key != '' and priority < 98)
         ORDER BY priority ASC
     ''')
     sources = cursor.fetchall()
@@ -521,48 +536,34 @@ def fetch_data_multi_source(symbol, start_date, end_date):
         logger.error("No enabled data sources configured")
         return None
     
-    for source_name, api_key in sources:
-        logger.info(f"Trying {source_name} for {symbol}")
-        
+    for source_name, api_key in sources:       
         try:
             if source_name == 'yfinance':
                 quotes = fetch_yfinance(symbol, start_date, end_date)
-                if quotes:
-                    logger.info(f"Successfully fetched {len(quotes)} quotes from {source_name}")
-                    return quotes
-                    
-            elif source_name == 'alphavantage':
-                if not api_key:
-                    logger.warning(f"Skipping {source_name}: no API key configured")
-                    continue
-                quotes = fetch_alphavantage(symbol, start_date, end_date, api_key)
-                if quotes:
-                    logger.info(f"Successfully fetched {len(quotes)} quotes from {source_name}")
-                    return quotes
-                    
-            elif source_name == 'fmp':
-                if not api_key:
-                    logger.warning(f"Skipping {source_name}: no API key configured")
-                    continue
-                quotes = fetch_fmp(symbol, start_date, end_date, api_key)
-                if quotes:
-                    logger.info(f"Successfully fetched {len(quotes)} quotes from {source_name}")
-                    return quotes
-                    
-            elif source_name == 'finnhub':
-                if not api_key:
-                    logger.warning(f"Skipping {source_name}: no API key configured")
-                    continue
-                quotes = fetch_finnhub(symbol, start_date, end_date, api_key)
-                if quotes:
-                    logger.info(f"Successfully fetched {len(quotes)} quotes from {source_name}")
-                    return quotes
-                    
             else:
-                logger.warning(f"Unknown source: {source_name}")
-                
+                if not api_key:
+                    logger.warning(f"{source_name}: Skipping - no API key configured")
+                    continue
+                   
+                if source_name == 'alphavantage':
+                    quotes = fetch_alphavantage(symbol, start_date, end_date, api_key)
+                        
+                elif source_name == 'fmp':
+                    quotes = fetch_fmp(symbol, start_date, end_date, api_key)
+                        
+                elif source_name == 'finnhub':
+                    quotes = fetch_finnhub(symbol, start_date, end_date, api_key)
+                        
+                else:
+                    logger.warning(f"{source_name}: Unknown source: '{source_name}'")
+                    continue
+
+            if quotes:
+                logger.info(f"{source_name}: Successfully fetched {len(quotes)} quotes ")
+                return quotes
+
         except Exception as e:
-            logger.error(f"Error with {source_name} for {symbol}: {e}")
+            logger.error(f"{source_name}: Error with {symbol}: {e}")
             continue  # Try next source
     
     logger.error(f"All enabled sources failed for {symbol}")
@@ -597,7 +598,6 @@ def fetch_alphavantage(symbol, start_date, end_date, api_key):
             'datatype': 'json'
         }
         
-        logger.info(f"Fetching {symbol} from Alpha Vantage")
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         
@@ -605,21 +605,21 @@ def fetch_alphavantage(symbol, start_date, end_date, api_key):
         
         # Check for error messages
         if 'Error Message' in data:
-            logger.error(f"Alpha Vantage error: {data['Error Message']}")
+            logger.error(f"AlphaVantage: error {data['Error Message']}")
             return None
         
         if 'Note' in data:
             # Daily rate limit hit (25 requests/day)
-            logger.warning(f"Alpha Vantage daily rate limit hit")
+            logger.warning(f"AlphaVantage: daily rate limit hit")
             return None
         
         if 'Information' in data:
             # Burst rate limit message
-            logger.warning(f"Alpha Vantage burst rate limit (ignoring - we have rate limiting)")
+            logger.warning(f"AlphaVantage: burst rate limit (ignoring - we have rate limiting)")
             # Don't return None here - might still have data
         
         if 'Time Series (Daily)' not in data:
-            logger.error(f"Alpha Vantage: no time series data for {symbol}")
+            logger.error(f"AlphaVantage: no time series data for {symbol}")
             return None
         
         time_series = data['Time Series (Daily)']
@@ -669,7 +669,7 @@ def fetch_alphavantage(symbol, start_date, end_date, api_key):
 def fetch_fmp(symbol, start_date, end_date, api_key):
     """Fetch data from Financial Modeling Prep"""
     # TODO: Implement FMP fetching
-    logger.warning("FMP fetching not yet implemented")
+    logger.warning("FMP: fetching not yet implemented")
     return None
 
 
@@ -696,7 +696,6 @@ def fetch_finnhub(symbol, start_date, end_date, api_key):
             'token': api_key
         }
         
-        logger.info(f"Fetching {symbol} from Finnhub")
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         
@@ -705,7 +704,7 @@ def fetch_finnhub(symbol, start_date, end_date, api_key):
         # Check for errors
         if 's' not in data:
             logger.error(f"Finnhub: unexpected response format for {symbol}")
-            logger.debug(f"Response: {data}")
+            logger.debug(f"Finnhub Response: {data}")
             return None
         
         # Check status
@@ -714,7 +713,7 @@ def fetch_finnhub(symbol, start_date, end_date, api_key):
             return None
         
         if data['s'] != 'ok':
-            logger.error(f"Finnhub error status: {data['s']}")
+            logger.error(f"Finnhub: error status: {data['s']}")
             return None
         
         # Finnhub returns parallel arrays
@@ -758,7 +757,14 @@ def fetch_finnhub(symbol, start_date, end_date, api_key):
             logger.info(f"Finnhub: retrieved {len(quotes)} quotes for {symbol}")
         
         return quotes if quotes else None
-    
+
+    except requests.exceptions.HTTPError as e:
+        # Handle HTTP errors separately
+        if e.response.status_code == 403:
+            logger.info(f"Finnhub: {symbol} not available (possibly mutual fund)")
+        else:
+            logger.error(f"Finnhub HTTP error for {symbol}: {e}")
+        return None
     except requests.exceptions.RequestException as e:
         logger.error(f"Finnhub request error for {symbol}: {e}")
         return None
@@ -871,12 +877,13 @@ def smart_update_symbol(symbol, years=None):
     else:
         # Existing symbol: fetch from last date + 1
         start_date = last_date + timedelta(days=1)
-        logger.info(f"Updating {symbol} from {start_date}")
-    
-    # Don't fetch if we're already up to date
-    if start_date > today:
-        logger.info(f"{symbol} already up to date")
-        return True
+        
+        # If already current, skip
+        if start_date > today:
+            logger.info(f"{symbol} already up to date (last: {last_date})")
+            return True
+        
+        logger.info(f"Updating {symbol} from {start_date} to {today}")
     
     # Fetch data
     quotes = fetch_data_multi_source(symbol, start_date.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d'))
@@ -889,11 +896,15 @@ def smart_update_symbol(symbol, years=None):
         # Detect market closures based on missing dates
         missing = get_missing_dates(symbol, start_date, today)
         if missing:
-            detect_market_closures(symbol, missing[:10])  # Check first 10 missing dates
+            detect_market_closures(symbol, missing[:10])
         
         return True
     else:
-        logger.warning(f"No data fetched for {symbol}")
+        # No data available yet - not necessarily an error
+        if start_date == today:
+            logger.info(f"No new data yet for {symbol} (checking for today {today})")
+        else:
+            logger.warning(f"No data fetched for {symbol} from {start_date} to {today}")
         return False
 
 def update_all_symbols(years=None):
@@ -1152,11 +1163,29 @@ def health():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/config')
+@app.route('/config')
 def view_config():
     """View current configuration"""
     try:
-        config = list_config()
-        return jsonify({item['key']: item['value'] for item in config})
+        all_config = list_config()
+        
+        # Convert config results to dict
+        config_dict = {item['key']: item['value'] for item in all_config['config']}
+        
+        # Convert data sources to list of dicts
+        sources_list = []
+        for item in all_config['data_sources']:
+            sources_list.append({
+                'source_name': item['source_name'],
+                'api_key': item['api_key'] if item['api_key'] else 'Not Set',  
+                'rate_limit': item['rate_limit'],
+                'priority': item['priority']
+            })
+        
+        return jsonify({
+            'config': config_dict,
+            'data_sources': sources_list
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1497,21 +1526,21 @@ def scheduled_update():
 
 def start_scheduler():
     """Start background scheduler for automatic updates"""
-    update_time = get_config('update_time') or '15:30'
+    update_time = get_config('update_time') or '20:30'
     hour, minute = map(int, update_time.split(':'))
     
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         scheduled_update,
         'cron',
-        day_of_week='mon-fri',
+        day_of_week='mon-sat',
         hour=hour,
         minute=minute
     )
     scheduler.start()
     
-    logger.info(f"Scheduler started: updates at {update_time} Mon-Fri")
-    print(f"Automatic updates scheduled for {update_time} Mon-Fri")
+    logger.info(f"Scheduler started: updates at {update_time} Mon-Sat")
+    print(f"Automatic updates scheduled for {update_time} Mon-Sat")
     
     return scheduler
 
@@ -1586,12 +1615,24 @@ def main():
     
     if args.config:
         if args.config[0] == 'list':
-            config = list_config()
-            print(f"\n{'Key':<30} {'Value':<20} {'Description'}")
+            all_config = list_config()
+            
+            # Show config table
+            print(f"{'='*80}")
+            print(f"{'Configuration Key':<30} {'Value':<20} {'Description'}")
             print('-' * 80)
-            for item in config:
+            for item in all_config['config']:
                 print(f"{item['key']:<30} {item['value']:<20} {item['description'] or ''}")
-            print()
+            
+            # Show data sources table
+            print(f"{'='*80}")
+            print(f"{'Source':<15} {'Priority':<10} {'Rate Limit':<12} {'API Key':<45} ")
+            print('-' * 80)
+            for item in all_config['data_sources']:
+                api_key_display = item['api_key'] if item['api_key'] else "Not Set"
+                print(f"{item['source_name']:<15} {item['priority']:<10} {item['rate_limit']:<12} {api_key_display:<45}" )
+            print(f"{'='*80}\n")
+            return  
         elif args.config[0] == 'get' and len(args.config) > 1:
             value = get_config(args.config[1])
             print(f"{args.config[1]} = {value}")
