@@ -1600,7 +1600,7 @@ def main():
                 set_api_key(args.config[2], args.config[3])
                 print(f"API key set for {args.config[2]}")
             elif args.config[1] == 'priority':
-                set_source_priority(args.config[2], args.config[3]])
+                set_source_priority(args.config[2], args.config[3])
                 print(f"Priority updated: {args.config[2]} = {args.config[3]}")
                 logger.info(f"Priority updated: {args.config[2]} = {args.config[3]}")
             else:
