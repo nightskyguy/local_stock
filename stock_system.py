@@ -20,6 +20,7 @@ Usage:
     python stock_system.py --init
     python stock_system.py --add AAPL --add CSCO --add TSLA
     python stock_system.py --remove SYMBOL
+    python stock_system.py --exportcsv [filename=stock_system_export.csv] [SYMBOL]
     
     # Updates
     python stock_system.py --update [--years N]
@@ -55,6 +56,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import threading
 import socket
 import atexit
+import csv
 
 # Get Lock File with PID (if it exists)
 LOCK_FILE = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system.lock')
@@ -208,10 +210,10 @@ def initialize_data_sources():
     cursor = conn.cursor()
     
     sources = [
-        ('yfinance', '', 2000, 1, 1, 'Yahoo Finance via yfinance - Free, no API key'),
-        ('finnhub', '', 60, 0, 2, 'Finnhub - Free tier: 60 calls/min'),
-        ('alphavantage', '', 25, 0, 3, 'Alpha Vantage - Free tier: 25 req/day'),
-        ('fmp', '', 250, 0, 4, 'Financial Modeling Prep - Free tier: 250 req/day'),
+        ('yfinance', '', 2000, 1, 1, 'Yahoo Finance via yfinance - Free, no API key https://ranaroussi.github.io/yfinance/'),
+        ('finnhub', '', 60, 0, 2, 'Finnhub - Free tier: 60 calls/min https://finnhub.io/docs/api'),
+        ('alphavantage', '', 25, 0, 3, 'Alpha Vantage - Free tier: 25 req/day https://www.alphavantage.co/documentation/'),
+        ('fmp', '', 250, 0, 4, 'Financial Modeling Prep - Free tier: 250 req/day https://site.financialmodelingprep.com/developer/docs'),
     ]
     
     for source in sources:
@@ -277,9 +279,18 @@ def set_source_priority(source, priority):
     """Set data source priority """
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('UPDATE data_sources SET priority = ? WHERE source_name = ?', (source, priority))
+    cursor.execute('UPDATE data_sources SET priority = ? WHERE source_name = ?', (priority, source))
+
+    # Check how many rows were affected
+    if cursor.rowcount == 0:
+        logger.warning(f"Source '{source}' not found in data_sources table so NOT set to '{priority}'")
+        conn.close()
+        return False
+    
     conn.commit()
+    logger.info(f"Updated priority for source '{source}' to {priority}")
     conn.close()
+    return True
 
 def set_api_key(source, key):
     """Set API key for data source"""
@@ -668,9 +679,81 @@ def fetch_alphavantage(symbol, start_date, end_date, api_key):
 
 def fetch_fmp(symbol, start_date, end_date, api_key):
     """Fetch data from Financial Modeling Prep"""
-    # TODO: Implement FMP fetching
-    logger.warning("FMP: fetching not yet implemented")
-    return None
+    try:
+        import requests
+        from datetime import datetime
+        
+        # FMP uses date strings directly (YYYY-MM-DD format)
+        # Historical price endpoint
+        url = f'https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}'
+        params = {
+            'from': start_date,
+            'to': end_date,
+            'apikey': api_key
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Check for errors
+        if 'Error Message' in data:
+            logger.error(f"FMP: {data['Error Message']} for {symbol}")
+            return None
+        
+        # FMP returns data in a nested structure
+        if 'historical' not in data:
+            logger.warning(f"FMP: no historical data available for {symbol}")
+            return None
+        
+        historical = data['historical']
+        
+        if not historical:
+            logger.warning(f"FMP: empty data for {symbol}")
+            return None
+        
+        # Convert to our quote format
+        quotes = []
+        for record in historical:
+            try:
+                quotes.append({
+                    'symbol': symbol,
+                    'quote_date': record['date'],
+                    'open': round(record['open'], 2) if record.get('open') is not None else None,
+                    'high': round(record['high'], 2) if record.get('high') is not None else None,
+                    'low': round(record['low'], 2) if record.get('low') is not None else None,
+                    'close': round(record['close'], 2) if record.get('close') is not None else None,
+                    'volume': int(record['volume']) if record.get('volume') is not None else 0,
+                    'dividends': 0,  # FMP includes this in separate dividend endpoint
+                    'stock_splits': 0,  # FMP includes this in separate splits endpoint
+                    'data_source': 'fmp'
+                })
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning(f"Skipping record for {symbol} on {record.get('date', 'unknown')}: {e}")
+                continue
+        
+        if quotes:
+            quotes.sort(key=lambda x: x['quote_date'])
+            logger.info(f"FMP: retrieved {len(quotes)} quotes for {symbol}")
+        
+        return quotes if quotes else None
+
+    except requests.exceptions.HTTPError as e:
+        # Handle HTTP errors separately
+        if e.response.status_code == 403:
+            logger.error(f"FMP: API key invalid or access denied for {symbol}")
+        elif e.response.status_code == 404:
+            logger.info(f"FMP: {symbol} not found")
+        else:
+            logger.error(f"FMP HTTP error for {symbol}: {e}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"FMP request error for {symbol}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"FMP error for {symbol}: {e}")
+        return None
 
 
 def fetch_finnhub(symbol, start_date, end_date, api_key):
@@ -771,6 +854,69 @@ def fetch_finnhub(symbol, start_date, end_date, api_key):
     except Exception as e:
         logger.error(f"Finnhub error for {symbol}: {e}")
         return None
+
+def bulk_get_quotes(symbol=None, db_path=DEFAULT_DB_PATH):
+    """
+    Retrieve daily quotes from database.
+    
+    Args:
+        symbol: Stock symbol to retrieve (None = all symbols)
+        db_path: Path to SQLite database
+        
+    Returns:
+        Tuple of (column_names, rows) where:
+            column_names: List of column names
+            rows: List of tuples containing quote data
+        Returns (None, None) on error
+    """
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Build query based on whether symbol is specified
+        if symbol:
+            query = '''
+                SELECT symbol, quote_date, open, high, low, close, volume, 
+                       dividends, stock_splits, data_source, last_updated
+                FROM daily_quotes
+                WHERE symbol = ?
+                ORDER BY symbol, quote_date
+            '''
+            cursor.execute(query, (symbol.upper(),))
+            logger.info(f"Retrieving quotes for {symbol.upper()}")
+        else:
+            query = '''
+                SELECT symbol, quote_date, open, high, low, close, volume, 
+                       dividends, stock_splits, data_source, last_updated
+                FROM daily_quotes
+                ORDER BY symbol, quote_date
+            '''
+            cursor.execute(query)
+            logger.info("Retrieving quotes for all symbols")
+        
+        # Get column names from cursor description
+        column_names = [description[0] for description in cursor.description]
+        
+        # Fetch all results
+        rows = cursor.fetchall()
+        
+        conn.close()
+        
+        if not rows:
+            logger.warning(f"No data found{' for ' + symbol if symbol else ''}")
+            return column_names, []
+        
+        logger.info(f"Retrieved {len(rows)} quotes from database")
+        return column_names, rows
+        
+    except sqlite3.Error as e:
+        logger.error(f"Database error during retrieval: {e}")
+        return None, None
+    except Exception as e:
+        logger.error(f"Unexpected error during retrieval: {e}")
+        return None, None
+
 
 def save_quotes(quotes):
     """Save quotes to database"""
@@ -1082,6 +1228,68 @@ def list_market_closures():
 
 app = Flask(__name__)
 
+@app.route('/export/<symbol>')
+@app.route('/export')
+def export_quotes_to_html(symbol=None):
+    """
+    Generate HTML table from daily quotes.
+    
+    Args:
+        symbol: Stock symbol to export (None = all symbols)
+        db_path: Path to SQLite database
+        
+    Returns:
+        HTML string, or None on error
+    """
+    
+    # Get data from database
+    column_names, rows = bulk_get_quotes(symbol, DB_PATH)
+    
+    if column_names is None:
+        logger.error("Failed to retrieve data from database")
+        return '<H2>Failed to Retrieve Data</H2>'
+    
+    if not rows:
+        logger.warning(f"No data to export{' for ' + symbol if symbol else ''}")
+        return f"<H2>No Data for '{symbol}'</H2>"
+    
+    try:
+        html_parts = []
+        html_parts.append('<!DOCTYPE html>\n<html>\n<head>\n')
+        html_parts.append('<title>Stock Quotes</title>\n')
+        html_parts.append('<style>\n')
+        html_parts.append('table { border-collapse: collapse; width: 100%; }\n')
+        html_parts.append('th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }\n')
+        html_parts.append('th { background-color: #4CAF50; color: white; }\n')
+        html_parts.append('tr:nth-child(even) { background-color: #f2f2f2; }\n')
+        html_parts.append('</style>\n</head>\n<body>\n')
+        html_parts.append(f'<h1>Stock Quotes{" for " + symbol if symbol else ""}</h1>\n')
+        html_parts.append('<table>\n<thead><tr>\n')
+        
+        # Write headers
+        for col in column_names:
+            html_parts.append(f'<th>{col}</th>\n')
+        html_parts.append('</tr></thead>\n<tbody>\n')
+        
+        # Write data rows
+        for row in rows:
+            html_parts.append('<tr>\n')
+            for value in row:
+                html_parts.append(f'<td>{value if value is not None else ""}</td>\n')
+            html_parts.append('</tr>\n')
+        
+        html_parts.append('</tbody>\n</table>\n</body>\n</html>')
+        
+        html_string = ''.join(html_parts)
+        
+        logger.info(f"Successfully generated HTML for {len(rows)} quotes")
+        return html_string
+        
+    except Exception as e:
+        logger.error(f"Error generating HTML: {e}")
+        return None
+
+
 @app.route('/shutdown', methods=['POST', 'GET'])
 @app.route('/serverstop', methods=['POST', 'GET'])
 def shutdown():
@@ -1104,19 +1312,18 @@ def shutdown():
 @app.route('/')
 def home():
     """Show API documentation"""
-    return """
-    <h1>Stock Quote Server</h1>
-    <p>Server is running!</p>
+    return f"<h1>Stock Quote Server (pid={os.getpid()})</h1>"+"""
     <h2>API Endpoints:</h2>
     <ul>
         <li><code>/quote/&lt;symbol&gt;</code> - Latest close price</li>
         <li><code>/quote/&lt;symbol&gt;/now</code> - Live quote (15min cache)</li>
         <li><code>/quote/&lt;symbol&gt;/&lt;date&gt;</code> - Price on specific date (YYYY-MM-DD)</li>
         <li><code>/quote/&lt;symbol&gt;/field/&lt;field&gt;</code> - Latest value for field (open, high, low, close, volume)</li>
+        <li><code>/export/&lt;symbol&gt;</code> - Export all available quotes includes (open, high, low, close, volume)</li>
         <li><code>/latest_date/&lt;symbol&gt;</code> - Most recent date with data</li>
-        <li><code>/closures</code> - List all detected market closure dates</li>
-        <li><code>/config</code> - View configuration (read-only)</li>
-        <li><code>/health</code> - Server health check</li>
+        <li><a href="/closures"><code>/closures</code></a> - List all detected market closure dates</li>
+        <li><a href="/config"><code>/config</code></a> - View configuration (read-only)</li>
+        <li><a href="/health"><code>/health</code></a> - Server health check</li>
         <li><code>/shutdown</code> - Stop the server</li>
     </ul>
     <h2>Examples:</h2>
@@ -1125,10 +1332,8 @@ def home():
         <li><a href="/quote/AAPL/now">/quote/AAPL/now</a></li>
         <li><a href="/quote/CSCO/2025-01-15">/quote/CSCO/2025-01-15</a></li>
         <li><a href="/quote/AAPL/field/high">/quote/AAPL/field/high</a></li>
+        <li><a href="/export/QQQ">/export/QQQ</a> <B>Warning: Large amount of data</B> </li> 
         <li><a href="/latest_date/AAPL">/latest_date/AAPL</a></li>
-        <li><a href="/config">/config</a></li>
-        <li><a href="/health">/health</a></li>
-        <li><a href="/closures">/closures</a></li>
     </ul>
     """
 
@@ -1163,7 +1368,6 @@ def health():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/config')
-@app.route('/config')
 def view_config():
     """View current configuration"""
     try:
@@ -1177,7 +1381,7 @@ def view_config():
         for item in all_config['data_sources']:
             sources_list.append({
                 'source_name': item['source_name'],
-                'api_key': item['api_key'] if item['api_key'] else 'Not Set',  
+                'api_key': item['api_key'] if item['api_key'] else 'NOT SET',  
                 'rate_limit': item['rate_limit'],
                 'priority': item['priority']
             })
@@ -1510,6 +1714,55 @@ def stop_server():
         print(f"Error stopping server: {e}")
         logger.error(f"Error stopping server: {e}")
 
+def export_quotes_to_csv(output_filename = 'stock_system_export.csv', symbol=None):
+    """
+    Export daily quotes to CSV file.
+    
+    Args:
+        output_filename: Path to output CSV file
+        symbol: Stock symbol to export (None = all symbols)
+        db_path: Path to SQLite database
+        
+    Returns:
+        Number of records exported, or None on error
+    """
+
+    logger.info(f"Exporting quotes for symbol '{symbol}' to file '{output_filename}'")
+
+
+    # Get data from database
+    column_names, rows = bulk_get_quotes(symbol, DB_PATH)
+    
+    if column_names is None:
+        logger.error("Failed to retrieve data from database")
+        return None
+    
+    if not rows:
+        logger.warning(f"No data to export{' for ' + symbol if symbol else ''}")
+        return 0
+    
+    try:
+        # Write to CSV
+        with open(output_filename, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Write header
+            writer.writerow(column_names)
+            
+            # Write data rows
+            writer.writerows(rows)
+        
+        logger.info(f"Successfully exported {len(rows)} quotes to {output_filename}")
+        return len(rows)
+        
+    except IOError as e:
+        logger.error(f"File error during export: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error during export: {e}")
+        return None
+
+
 
 # ============================================================================
 # SCHEDULED UPDATES
@@ -1561,11 +1814,14 @@ def main():
     parser.add_argument('--init', action='store_true', help='Initialize database')
     parser.add_argument('--add', action='append', help='Add symbol(s) - can use multiple times')
     parser.add_argument('--remove', type=str, help='Remove symbol')
-    
+    parser.add_argument('--export', '--exportcsv', action='store_true', help='Export to CSV')
+    parser.add_argument('--filename', type=str, default='stock_system_quotes.csv', help='CSV output filename (default: stock_system_quotes.csv)')
+    parser.add_argument('--symbol', type=str, help='Symbol to export eg "QQQ" (default: all symbols)')    
+
+
     # Updates
     parser.add_argument('--update', action='store_true', help='Update all symbols')
     parser.add_argument('--years', type=int, help='Years of history to fetch (for new symbols)')
-    parser.add_argument('--trigger-update', action='store_true', help='Trigger immediate update')
     
     # Configuration
     parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY')
@@ -1606,10 +1862,17 @@ def main():
         remove_symbol(args.remove)
         return
     
-    if args.update or args.trigger_update:
+    if args.update:
         update_all_symbols(args.years)
         return
+
     
+    if args.export:
+        # We expect up to two arguments: filename, and symbol.
+        export_quotes_to_csv(args.filename, args.symbol)
+        return
+
+
     if args.config:
         if args.config[0] == 'list':
             all_config = list_config()
@@ -1638,9 +1901,10 @@ def main():
                 set_api_key(args.config[2], args.config[3])
                 print(f"API key set for {args.config[2]}")
             elif args.config[1] == 'priority':
-                set_source_priority(args.config[2], args.config[3])
-                print(f"Priority updated: {args.config[2]} = {args.config[3]}")
-                logger.info(f"Priority updated: {args.config[2]} = {args.config[3]}")
+                if set_source_priority(args.config[2], args.config[3]):
+                    print(f"Priority updated: {args.config[2]} = {args.config[3]}")
+                else: 
+                    print(f"Priority NOT updated: {args.config[2]} = {args.config[3]}")
             else:
                 # TODO This seems useless now.
                 set_config(args.config[1], args.config[2])
