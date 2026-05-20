@@ -57,6 +57,7 @@ import threading
 import socket
 import atexit
 import csv
+from zoneinfo import ZoneInfo
 
 # Get Lock File with PID (if it exists)
 LOCK_FILE = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system.lock')
@@ -172,6 +173,7 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS market_closures (
             date TEXT PRIMARY KEY,
             confirmed_count INTEGER DEFAULT 1,
+            reason TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -242,6 +244,11 @@ def migrate_schema():
         CREATE INDEX IF NOT EXISTS idx_fund_metrics_symbol_date
         ON fund_metrics(symbol, metric_date DESC)
     ''')
+
+    cursor.execute("PRAGMA table_info(market_closures)")
+    mc_cols = {row[1] for row in cursor.fetchall()}
+    if 'reason' not in mc_cols:
+        cursor.execute("ALTER TABLE market_closures ADD COLUMN reason TEXT")
 
     conn.commit()
     conn.close()
@@ -536,35 +543,33 @@ def get_market_closures():
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT date
+        SELECT date, reason
         FROM market_closures
         ORDER BY date DESC
     ''')
     closures = cursor.fetchall()
     conn.close()
-    
-    # Format with day names
+
     result = []
     for row in closures:
         date_str = row['date']
         date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-        day_name = date_obj.strftime('%A')
-        
         result.append({
-            'day': day_name,
-            'date': date_str
+            'day': date_obj.strftime('%A'),
+            'date': date_str,
+            'reason': row['reason'] or '',
         })
-    
+
     return result
 
-def mark_market_closure(date):
+def mark_market_closure(date, reason=None):
     """Mark a date as market closure"""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO market_closures (date, confirmed_count, created_at)
-        VALUES (?, 1, CURRENT_TIMESTAMP)
-    ''', (date,))
+        INSERT OR REPLACE INTO market_closures (date, confirmed_count, reason, created_at)
+        VALUES (?, 1, ?, CURRENT_TIMESTAMP)
+    ''', (date, reason))
     conn.commit()
     conn.close()
     logger.info(f"Marked market closure: {date}")
@@ -1450,18 +1455,16 @@ def auto_fetch_symbol(symbol):
 # ============================================================================
 
 def is_market_open():
-    """Check if market is open (9:30 AM - 4:00 PM local time, Mon-Fri)"""
-    now = datetime.now()
-    
-    # Weekend check
-    if now.weekday() >= 5:
+    """Check if market is open (9:30 AM - 4:00 PM ET, Mon-Fri)"""
+    now_et = datetime.now(ZoneInfo('America/New_York'))
+
+    if now_et.weekday() >= 5:
         return False
-    
-    # Time check (local timezone)
-    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    
-    return market_open <= now <= market_close
+
+    market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+
+    return market_open <= now_et <= market_close
 
 def get_live_quote(symbol):
     """Get live quote with caching"""
@@ -1507,16 +1510,14 @@ def get_live_quote(symbol):
 # STATISTICS
 # ============================================================================
 
-def show_statistics():
-    """Show database statistics"""
+def get_statistics():
+    """Return database statistics as a dict."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Total quotes
+
     cursor.execute('SELECT COUNT(*) as count FROM daily_quotes')
     total_quotes = cursor.fetchone()['count']
-    
-    # Symbol breakdown
+
     cursor.execute('''
         SELECT s.symbol, COUNT(dq.quote_date) as quotes,
                MIN(dq.quote_date) as first_date,
@@ -1528,48 +1529,91 @@ def show_statistics():
         ORDER BY s.symbol
     ''')
     symbols = cursor.fetchall()
-    
-    # Market closures
+
     cursor.execute('SELECT COUNT(*) as count FROM market_closures')
     closure_count = cursor.fetchone()['count']
-    
+
     conn.close()
-    
+
+    return {
+        'db_path': DB_PATH,
+        'total_quotes': total_quotes,
+        'closure_count': closure_count,
+        'symbols': [
+            {
+                'symbol': row['symbol'],
+                'quotes': row['quotes'],
+                'first_date': row['first_date'] or 'N/A',
+                'last_date': row['last_date'] or 'N/A',
+            }
+            for row in symbols
+        ],
+    }
+
+
+def show_statistics():
+    """Show database statistics"""
+    stats = get_statistics()
+
     print(f"\n{'='*70}")
-    print(f"Database: {DB_PATH}")
-    print(f"Total Quotes: {total_quotes:,}")
-    print(f"Market Closures Detected: {closure_count}")
+    print(f"Database: {stats['db_path']}")
+    print(f"Total Quotes: {stats['total_quotes']:,}")
+    print(f"Market Closures Detected: {stats['closure_count']}")
     print(f"{'='*70}")
     print(f"{'Symbol':<10} {'Quotes':>10} {'First Date':<12} {'Last Date':<12}")
     print(f"{'-'*70}")
-    
-    for row in symbols:
-        print(f"{row['symbol']:<10} {row['quotes']:>10,} {row['first_date'] or 'N/A':<12} {row['last_date'] or 'N/A':<12}")
-    
+
+    for row in stats['symbols']:
+        print(f"{row['symbol']:<10} {row['quotes']:>10,} {row['first_date']:<12} {row['last_date']:<12}")
+
     print(f"{'='*70}\n")
 
 def list_market_closures():
     """List all detected market closure dates"""
     closures = get_market_closures()
-    
+
     if not closures:
         print("No market closures detected yet")
         return
-    
-    print(f"\n{'='*60}")
+
+    print(f"\n{'='*80}")
     print(f"Detected Market Closures: {len(closures)}")
-    print(f"{'='*60}")
-    print(f"{'Day':<12} {'Date':<15} ")
-    print(f"{'-'*60}")
-    
+    print(f"{'='*80}")
+    print(f"{'Day':<12} {'Date':<15} {'Reason'}")
+    print(f"{'-'*80}")
+
     for row in closures:
-        date_str = row['date']
-        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-        day_name = date_obj.strftime('%A')
-        
-        print(f"{day_name:<12} {date_str:<15} ")
-    
-    print(f"{'='*60}\n")    
+        print(f"{row['day']:<12} {row['date']:<15} {row['reason']}")
+
+    print(f"{'='*80}\n")
+
+
+def import_closures_from_file(filename):
+    """Import market closures from a CSV file (DATE[,REASON] per line)."""
+    if not os.path.exists(filename):
+        print(f"Error: File not found: {filename}")
+        return
+
+    imported = 0
+    skipped = 0
+    with open(filename, newline='', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split(',', 1)
+            date_str = parts[0].strip()
+            reason = parts[1].strip() if len(parts) > 1 else None
+            try:
+                datetime.strptime(date_str, '%Y-%m-%d')
+            except ValueError:
+                print(f"  Line {lineno}: skipped (invalid date '{date_str}')")
+                skipped += 1
+                continue
+            mark_market_closure(date_str, reason)
+            imported += 1
+
+    print(f"Import complete: {imported} closures imported, {skipped} lines skipped.")
 
 # ============================================================================
 # WEB SERVER
@@ -1705,6 +1749,104 @@ def get_fund_type_endpoint(symbol):
         return jsonify({'error': str(e)}), 500
 
 
+def get_cache_html():
+    """Build an HTML page showing the current contents of live_quote_cache."""
+    with cache_lock:
+        snapshot = dict(live_quote_cache)
+
+    html_parts = []
+    html_parts.append('<!DOCTYPE html>\n<html>\n<head>\n')
+    html_parts.append('<title>Live Quote Cache</title>\n')
+    html_parts.append('<style>\n')
+    html_parts.append('body { font-family: Arial, sans-serif; margin: 20px; }\n')
+    html_parts.append('table { border-collapse: collapse; width: 100%; }\n')
+    html_parts.append('th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }\n')
+    html_parts.append('th { background-color: #4CAF50; color: white; }\n')
+    html_parts.append('tr:nth-child(even) { background-color: #f2f2f2; }\n')
+    html_parts.append('</style>\n</head>\n<body>\n')
+
+    if not snapshot:
+        html_parts.append('<h1>Live Quote Cache</h1>\n')
+        html_parts.append('<p>Cache is empty — no live quotes have been fetched yet.</p>\n')
+        html_parts.append('</body>\n</html>')
+        return ''.join(html_parts)
+
+    now = time.time()
+    html_parts.append(f'<h1>Live Quote Cache ({len(snapshot)} symbols)</h1>\n')
+    html_parts.append(f'<p>Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>\n')
+    html_parts.append('<table>\n<thead><tr>\n')
+    html_parts.append('<th>Symbol</th><th>Price</th><th>Cached At</th><th>Age (sec)</th>\n')
+    html_parts.append('</tr></thead>\n<tbody>\n')
+
+    for symbol in sorted(snapshot):
+        price, ts = snapshot[symbol]
+        cached_at = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+        age = int(now - ts)
+        html_parts.append('<tr>\n')
+        html_parts.append(f'<td><strong>{symbol}</strong></td>\n')
+        html_parts.append(f'<td>{price}</td>\n')
+        html_parts.append(f'<td>{cached_at}</td>\n')
+        html_parts.append(f'<td>{age}s</td>\n')
+        html_parts.append('</tr>\n')
+
+    html_parts.append('</tbody>\n</table>\n</body>\n</html>')
+    return ''.join(html_parts)
+
+
+def get_stats_html():
+    """Build an HTML page showing database statistics."""
+    stats = get_statistics()
+
+    html_parts = []
+    html_parts.append('<!DOCTYPE html>\n<html>\n<head>\n')
+    html_parts.append('<title>Stock System Statistics</title>\n')
+    html_parts.append('<style>\n')
+    html_parts.append('body { font-family: Arial, sans-serif; margin: 20px; }\n')
+    html_parts.append('table { border-collapse: collapse; width: 100%; }\n')
+    html_parts.append('th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }\n')
+    html_parts.append('th { background-color: #4CAF50; color: white; }\n')
+    html_parts.append('tr:nth-child(even) { background-color: #f2f2f2; }\n')
+    html_parts.append('td.num { text-align: right; }\n')
+    html_parts.append('</style>\n</head>\n<body>\n')
+    html_parts.append('<h1>Database Statistics</h1>\n')
+    html_parts.append(f'<p>Database: <code>{stats["db_path"]}</code></p>\n')
+    html_parts.append(f'<p>Total quotes: <strong>{stats["total_quotes"]:,}</strong> &nbsp;|&nbsp; ')
+    html_parts.append(f'Market closures recorded: <strong>{stats["closure_count"]}</strong></p>\n')
+    html_parts.append('<table>\n<thead><tr>\n')
+    html_parts.append('<th>Symbol</th><th class="num">Quotes</th><th>First Date</th><th>Last Date</th>\n')
+    html_parts.append('</tr></thead>\n<tbody>\n')
+
+    for row in stats['symbols']:
+        html_parts.append('<tr>\n')
+        html_parts.append(f'<td><strong>{row["symbol"]}</strong></td>\n')
+        html_parts.append(f'<td class="num">{row["quotes"]:,}</td>\n')
+        html_parts.append(f'<td>{row["first_date"]}</td>\n')
+        html_parts.append(f'<td>{row["last_date"]}</td>\n')
+        html_parts.append('</tr>\n')
+
+    html_parts.append('</tbody>\n</table>\n</body>\n</html>')
+    return ''.join(html_parts)
+
+
+@app.route('/stats')
+def view_stats():
+    """Database statistics as HTML"""
+    try:
+        return get_stats_html()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/cache')
+@app.route('/cache/<fmt>')
+def show_cache(fmt='html'):
+    """Live quote cache contents as HTML"""
+    try:
+        return get_cache_html()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/')
 def home():
     """Show API documentation"""
@@ -1722,6 +1864,8 @@ def home():
         <li><a href="/closures"><code>/closures</code></a> - List all detected market closure dates</li>
         <li><a href="/config"><code>/config</code></a> - View configuration (read-only)</li>
         <li><a href="/health"><code>/health</code></a> - Server health check</li>
+        <li><a href="/stats"><code>/stats</code></a> - Database statistics (HTML)</li>
+        <li><a href="/cache/html"><code>/cache/html</code></a> - Live quote cache contents</li>
         <li><code>/shutdown</code> - Stop the server</li>
     </ul>
     <h2>Examples:</h2>
@@ -2237,6 +2381,8 @@ def main():
     parser.add_argument('--stats', '--statistics', action='store_true', help='Show database statistics')
     parser.add_argument('--dbpath', action='store_true', help='Show database path')
     parser.add_argument('--closures', action='store_true', help='List all market closure dates')
+    parser.add_argument('--import-closures', type=str, metavar='FILE',
+                        help='Import market closures from CSV file (DATE[,REASON] per line, # for comments)')
     
     args = parser.parse_args()
     
@@ -2334,7 +2480,11 @@ def main():
     if args.closures:
         list_market_closures()
         return
-        
+
+    if args.import_closures:
+        import_closures_from_file(args.import_closures)
+        return
+
     if args.dbpath:
         print(f"Database: {DB_PATH}")
         return
