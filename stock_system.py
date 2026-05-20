@@ -140,7 +140,9 @@ def setup_database():
             first_fetch_date TEXT,
             last_fetch_date TEXT,
             active INTEGER DEFAULT 1,
-            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            symbol_type TEXT DEFAULT 'EQUITY',
+            fund_family TEXT
         )
     ''')
     
@@ -185,9 +187,64 @@ def setup_database():
         )
     ''')
     
+    # Fund metrics table (yield data for money market and other funds)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fund_metrics (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol           TEXT NOT NULL,
+            metric_date      TEXT NOT NULL,
+            yield_annual     REAL,
+            yield_source     TEXT,
+            total_assets     REAL,
+            expense_ratio    REAL,
+            data_source      TEXT,
+            last_updated     TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, metric_date)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_fund_metrics_symbol_date
+        ON fund_metrics(symbol, metric_date DESC)
+    ''')
+
     conn.commit()
     conn.close()
+    migrate_schema()
     logger.info(f"Database initialized: {DB_PATH}")
+
+def migrate_schema():
+    """Apply schema migrations to an existing database (idempotent)."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(symbols)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    if 'symbol_type' not in existing_cols:
+        cursor.execute("ALTER TABLE symbols ADD COLUMN symbol_type TEXT DEFAULT 'EQUITY'")
+    if 'fund_family' not in existing_cols:
+        cursor.execute("ALTER TABLE symbols ADD COLUMN fund_family TEXT")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fund_metrics (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol           TEXT NOT NULL,
+            metric_date      TEXT NOT NULL,
+            yield_annual     REAL,
+            yield_source     TEXT,
+            total_assets     REAL,
+            expense_ratio    REAL,
+            data_source      TEXT,
+            last_updated     TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, metric_date)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_fund_metrics_symbol_date
+        ON fund_metrics(symbol, metric_date DESC)
+    ''')
+
+    conn.commit()
+    conn.close()
 
 def initialize_default_config():
     """Insert default configuration values"""
@@ -309,10 +366,10 @@ def set_api_key(source, key):
 # ============================================================================
 
 def add_symbol(symbol):
-    """Add symbol to tracked list"""
+    """Add symbol to tracked list and classify its type."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     try:
         cursor.execute('''
             INSERT INTO symbols (symbol, active)
@@ -321,13 +378,19 @@ def add_symbol(symbol):
         conn.commit()
         logger.info(f"Symbol added: {symbol.upper()}")
         print(f"Added symbol: {symbol.upper()}")
-        return True
     except sqlite3.IntegrityError:
         logger.warning(f"Symbol already exists: {symbol.upper()}")
         print(f"Symbol already exists: {symbol.upper()}")
+        conn.close()
         return False
     finally:
         conn.close()
+
+    classification = classify_symbol(symbol.upper())
+    save_classification(symbol.upper(), classification)
+    family = f", Family: {classification['fund_family']}" if classification['fund_family'] else ""
+    print(f"  Type: {classification['symbol_type']}{family}")
+    return True
 
 def remove_symbol(symbol):
     """Remove symbol and all its data"""
@@ -390,6 +453,79 @@ def update_symbol_tracking(symbol):
         conn.commit()
     
     conn.close()
+
+# ============================================================================
+# SYMBOL CLASSIFICATION
+# ============================================================================
+
+def classify_symbol(symbol):
+    """Fetch yfinance metadata and return a classification dict."""
+    try:
+        info = yf.Ticker(symbol).info
+        quote_type = (info.get('quoteType') or 'EQUITY').upper()
+        type_map = {
+            'EQUITY': 'EQUITY',
+            'ETF': 'ETF',
+            'MUTUALFUND': 'MUTUALFUND',
+            'MONEY_MARKET': 'MONEY_MARKET',
+            'MONEYMARKET': 'MONEY_MARKET',
+            'INDEX': 'INDEX',
+            'CURRENCY': 'CURRENCY',
+            'CRYPTOCURRENCY': 'CRYPTO',
+        }
+        symbol_type = type_map.get(quote_type, 'UNKNOWN')
+        category = (info.get('category') or '').lower()
+        if symbol_type == 'MUTUALFUND' and 'money market' in category:
+            symbol_type = 'MONEY_MARKET'
+        return {
+            'symbol_type': symbol_type,
+            'fund_family': info.get('fundFamily'),
+            'name': info.get('longName') or info.get('shortName'),
+        }
+    except Exception as e:
+        logger.warning(f"Classification error for {symbol}: {e}")
+        return {'symbol_type': 'UNKNOWN', 'fund_family': None, 'name': None}
+
+def save_classification(symbol, classification):
+    """Upsert symbol classification into the symbols table."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO symbols (symbol, name, symbol_type, fund_family, active)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(symbol) DO UPDATE SET
+            symbol_type = excluded.symbol_type,
+            fund_family = excluded.fund_family,
+            name = COALESCE(excluded.name, symbols.name)
+    ''', (symbol.upper(), classification['name'],
+          classification['symbol_type'], classification['fund_family']))
+    conn.commit()
+    conn.close()
+
+def get_symbol_type(symbol):
+    """Return stored symbol_type, defaulting to EQUITY if not yet classified."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT symbol_type FROM symbols WHERE symbol = ?', (symbol.upper(),))
+    row = cursor.fetchone()
+    conn.close()
+    return row['symbol_type'] if row and row['symbol_type'] else 'EQUITY'
+
+def reclassify_all_symbols():
+    """Classify all active symbols using yfinance metadata."""
+    symbols = get_tracked_symbols()
+    if not symbols:
+        print("No symbols to classify.")
+        return
+    print(f"Classifying {len(symbols)} symbols...")
+    for symbol in symbols:
+        print(f"  {symbol}: ", end='', flush=True)
+        classification = classify_symbol(symbol)
+        save_classification(symbol, classification)
+        family = f" ({classification['fund_family']})" if classification['fund_family'] else ""
+        print(f"{classification['symbol_type']}{family}")
+        time.sleep(0.5)
+    print("Classification complete.")
 
 # ============================================================================
 # MARKET CLOSURE DETECTION
@@ -1002,6 +1138,212 @@ def get_missing_dates(symbol, start_date, end_date):
     return sorted(list(missing))
 
 # ============================================================================
+# MONEY MARKET FUND DATA
+# ============================================================================
+
+def fetch_mmf_yield_fred(symbol, start_date, end_date=None):
+    """
+    Fetch the daily Federal Funds Rate from FRED as a yield proxy for money
+    market funds. Uses FRED's public CSV endpoint — no API key required.
+    Returns a list of fund_metrics dicts.
+    """
+    if end_date is None:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+    try:
+        import urllib.request as _urllib
+        import csv as _csv
+        import io as _io
+
+        url = (
+            f"https://fred.stlouisfed.org/graph/fredgraph.csv"
+            f"?id=DFF&observation_start={start_date}&observation_end={end_date}"
+        )
+        req = _urllib.Request(url, headers={'User-Agent': 'local_stock/1.0'})
+        with _urllib.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode('utf-8')
+
+        metrics = []
+        reader = _csv.DictReader(_io.StringIO(content))
+        for row in reader:
+            date_str = row.get('DATE', '').strip()
+            rate_str = row.get('DFF', '').strip()
+            if not date_str or not rate_str or rate_str == '.':
+                continue
+            try:
+                metrics.append({
+                    'symbol': symbol.upper(),
+                    'metric_date': date_str,
+                    'yield_annual': float(rate_str) / 100.0,
+                    'yield_source': 'fred_dff',
+                    'total_assets': None,
+                    'expense_ratio': None,
+                    'data_source': 'fred',
+                })
+            except ValueError:
+                continue
+        logger.info(f"FRED: fetched {len(metrics)} yield records for {symbol}")
+        return metrics
+    except Exception as e:
+        logger.error(f"FRED fetch error for {symbol}: {e}")
+        return []
+
+def save_fund_metrics(metrics_list):
+    """Batch-save fund metric records to fund_metrics table."""
+    if not metrics_list:
+        return 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    inserted = 0
+    for m in metrics_list:
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO fund_metrics
+                (symbol, metric_date, yield_annual, yield_source,
+                 total_assets, expense_ratio, data_source, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (m['symbol'], m['metric_date'], m['yield_annual'],
+                  m['yield_source'], m.get('total_assets'),
+                  m.get('expense_ratio'), m['data_source']))
+            inserted += 1
+        except Exception as e:
+            logger.error(f"Error saving fund metric {m['symbol']} {m['metric_date']}: {e}")
+    conn.commit()
+    conn.close()
+    return inserted
+
+def compute_synthetic_prices(symbol):
+    """
+    Compound daily yield into a total-return price series starting at $1.00.
+    Returns daily_quotes-compatible dicts for all dates in fund_metrics.
+    price[t] = price[t-1] * (1 + yield_annual[t] / 365)
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT metric_date, yield_annual
+        FROM fund_metrics WHERE symbol = ?
+        ORDER BY metric_date ASC
+    ''', (symbol.upper(),))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return []
+
+    quotes = []
+    price = 1.0
+    for i, row in enumerate(rows):
+        if i > 0:
+            price *= (1.0 + (row['yield_annual'] or 0.0) / 365.0)
+        quotes.append({
+            'symbol': symbol.upper(),
+            'quote_date': row['metric_date'],
+            'open': price,
+            'high': price,
+            'low': price,
+            'close': price,
+            'volume': 0,
+            'dividends': row['yield_annual'] or 0.0,
+            'stock_splits': 0.0,
+            'data_source': 'synthetic_mmf',
+        })
+    return quotes
+
+def rebuild_synthetic_prices(symbol):
+    """Delete all price rows and recompute the synthetic series."""
+    quotes = compute_synthetic_prices(symbol)
+    if not quotes:
+        return 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM daily_quotes WHERE symbol = ?", (symbol.upper(),))
+    conn.commit()
+    conn.close()
+    return save_quotes(quotes)
+
+def update_synthetic_price_today(symbol):
+    """Append new synthetic price rows since the last stored date."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    recent = fetch_mmf_yield_fred(symbol, yesterday, today)
+    if recent:
+        save_fund_metrics(recent)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT quote_date, close FROM daily_quotes
+        WHERE symbol = ? AND data_source = 'synthetic_mmf'
+        ORDER BY quote_date DESC LIMIT 1
+    ''', (symbol.upper(),))
+    last_row = cursor.fetchone()
+    conn.close()
+
+    if not last_row:
+        return rebuild_synthetic_prices(symbol)
+
+    last_date = last_row['quote_date']
+    last_price = last_row['close']
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT metric_date, yield_annual FROM fund_metrics
+        WHERE symbol = ? AND metric_date > ?
+        ORDER BY metric_date ASC
+    ''', (symbol.upper(), last_date))
+    new_rows = cursor.fetchall()
+    conn.close()
+
+    if not new_rows:
+        return 0
+
+    price = last_price
+    new_quotes = []
+    for row in new_rows:
+        price *= (1.0 + (row['yield_annual'] or 0.0) / 365.0)
+        new_quotes.append({
+            'symbol': symbol.upper(),
+            'quote_date': row['metric_date'],
+            'open': price, 'high': price, 'low': price, 'close': price,
+            'volume': 0,
+            'dividends': row['yield_annual'] or 0.0,
+            'stock_splits': 0.0,
+            'data_source': 'synthetic_mmf',
+        })
+    return save_quotes(new_quotes)
+
+def add_money_market_fund(symbol, years=3):
+    """Add a symbol, force-classify as MONEY_MARKET, and seed historical yield."""
+    symbol = symbol.upper()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO symbols (symbol, active) VALUES (?, 1)', (symbol,))
+    conn.commit()
+    conn.close()
+
+    classification = classify_symbol(symbol)
+    classification['symbol_type'] = 'MONEY_MARKET'
+    save_classification(symbol, classification)
+    name_str = f" ({classification['name']})" if classification['name'] else ""
+    print(f"Added {symbol} as MONEY_MARKET{name_str}")
+
+    today = datetime.now()
+    start_date = (today - timedelta(days=365 * years)).strftime('%Y-%m-%d')
+    end_date = today.strftime('%Y-%m-%d')
+    print(f"  Fetching yield data from FRED ({start_date} to {end_date})...")
+    metrics = fetch_mmf_yield_fred(symbol, start_date, end_date)
+    if metrics:
+        saved = save_fund_metrics(metrics)
+        print(f"  Saved {saved} yield records")
+        rebuilt = rebuild_synthetic_prices(symbol)
+        update_symbol_tracking(symbol)
+        print(f"  Built {rebuilt} synthetic price records")
+    else:
+        print(f"  Failed to fetch yield data from FRED")
+
+# ============================================================================
 # SMART UPDATE LOGIC
 # ============================================================================
 
@@ -1010,7 +1352,14 @@ def smart_update_symbol(symbol, years=None):
     Smart update that only fetches missing data
     - New symbols: fetch full history (years parameter or default)
     - Existing symbols: fetch from last date forward
+    - Money market funds: update synthetic price from FRED yield
     """
+    symbol_type = get_symbol_type(symbol)
+    if symbol_type == 'MONEY_MARKET':
+        update_synthetic_price_today(symbol)
+        update_symbol_tracking(symbol)
+        return True
+
     last_date = get_last_date_for_symbol(symbol)
     today = datetime.now().date()
     
@@ -1309,16 +1658,65 @@ def shutdown():
     
     return jsonify({'message': 'Server shutting down...'}), 200
 
+@app.route('/yield/<symbol>')
+def get_yield_endpoint(symbol):
+    """Get most recent annualized yield for a money market fund"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT yield_annual, metric_date, yield_source
+            FROM fund_metrics
+            WHERE symbol = ?
+            ORDER BY metric_date DESC
+            LIMIT 1
+        ''', (symbol.upper(),))
+        row = cursor.fetchone()
+        conn.close()
+        if row and row['yield_annual'] is not None:
+            return jsonify({
+                'symbol': symbol.upper(),
+                'yield_annual': row['yield_annual'],
+                'date': row['metric_date'],
+                'source': row['yield_source']
+            })
+        return jsonify({'error': f'No yield data for {symbol.upper()}'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/fund_type/<symbol>')
+def get_fund_type_endpoint(symbol):
+    """Get asset type for a symbol"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT symbol_type, fund_family FROM symbols WHERE symbol = ?', (symbol.upper(),))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return jsonify({
+                'symbol': symbol.upper(),
+                'symbol_type': row['symbol_type'] or 'EQUITY',
+                'fund_family': row['fund_family']
+            })
+        return jsonify({'error': f'Symbol {symbol.upper()} not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/')
 def home():
     """Show API documentation"""
     return f"<h1>Stock Quote Server (pid={os.getpid()})</h1>"+"""
     <h2>API Endpoints:</h2>
     <ul>
-        <li><code>/quote/&lt;symbol&gt;</code> - Latest close price</li>
+        <li><code>/quote/&lt;symbol&gt;</code> - Latest close price (or compounded synthetic price for money market funds)</li>
         <li><code>/quote/&lt;symbol&gt;/now</code> - Live quote (15min cache)</li>
         <li><code>/quote/&lt;symbol&gt;/&lt;date&gt;</code> - Price on specific date (YYYY-MM-DD)</li>
         <li><code>/quote/&lt;symbol&gt;/field/&lt;field&gt;</code> - Latest value for field (open, high, low, close, volume)</li>
+        <li><code>/yield/&lt;symbol&gt;</code> - Latest annualized yield for money market funds</li>
+        <li><code>/fund_type/&lt;symbol&gt;</code> - Asset type (EQUITY, ETF, MUTUALFUND, MONEY_MARKET, …)</li>
         <li><code>/export/&lt;symbol&gt;</code> - Export all available quotes includes (open, high, low, close, volume)</li>
         <li><code>/latest_date/&lt;symbol&gt;</code> - Most recent date with data</li>
         <li><a href="/closures"><code>/closures</code></a> - List all detected market closure dates</li>
@@ -1332,8 +1730,13 @@ def home():
         <li><a href="/quote/AAPL/now">/quote/AAPL/now</a></li>
         <li><a href="/quote/CSCO/2025-01-15">/quote/CSCO/2025-01-15</a></li>
         <li><a href="/quote/AAPL/field/high">/quote/AAPL/field/high</a></li>
-        <li><a href="/export/QQQ">/export/QQQ</a> <B>Warning: Large amount of data</B> </li> 
+        <li><a href="/export/QQQ">/export/QQQ</a> <B>Warning: Large amount of data</B> </li>
         <li><a href="/latest_date/AAPL">/latest_date/AAPL</a></li>
+    </ul>
+    <h2>Money Market Fund CLI:</h2>
+    <ul>
+        <li><code>python stock_system.py --add-fund FDLXX</code> - Add MMF and seed full yield history</li>
+        <li><code>python stock_system.py --reclassify</code> - Reclassify all tracked symbols via yfinance</li>
     </ul>
     """
 
@@ -1822,6 +2225,10 @@ def main():
     # Updates
     parser.add_argument('--update', action='store_true', help='Update all symbols')
     parser.add_argument('--years', type=int, help='Years of history to fetch (for new symbols)')
+
+    # Money market fund management
+    parser.add_argument('--add-fund', type=str, metavar='SYMBOL', help='Add a money market fund and seed full yield history from FRED')
+    parser.add_argument('--reclassify', action='store_true', help='Reclassify all tracked symbols via yfinance (run once after migration)')
     
     # Configuration
     parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY')
@@ -1866,7 +2273,14 @@ def main():
         update_all_symbols(args.years)
         return
 
-    
+    if args.add_fund:
+        add_money_market_fund(args.add_fund.upper(), years=args.years or 3)
+        return
+
+    if args.reclassify:
+        reclassify_all_symbols()
+        return
+
     if args.export:
         # We expect up to two arguments: filename, and symbol.
         export_quotes_to_csv(args.filename, args.symbol)
