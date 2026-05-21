@@ -1170,7 +1170,7 @@ def fetch_mmf_yield_fred(symbol, start_date, end_date=None):
         metrics = []
         reader = _csv.DictReader(_io.StringIO(content))
         for row in reader:
-            date_str = row.get('DATE', '').strip()
+            date_str = row.get('observation_date', row.get('DATE', '')).strip()
             rate_str = row.get('DFF', '').strip()
             if not date_str or not rate_str or rate_str == '.':
                 continue
