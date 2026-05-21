@@ -1519,7 +1519,7 @@ def get_statistics():
     total_quotes = cursor.fetchone()['count']
 
     cursor.execute('''
-        SELECT s.symbol, COUNT(dq.quote_date) as quotes,
+        SELECT s.symbol, s.name, s.symbol_type, COUNT(dq.quote_date) as quotes,
                MIN(dq.quote_date) as first_date,
                MAX(dq.quote_date) as last_date
         FROM symbols s
@@ -1542,6 +1542,8 @@ def get_statistics():
         'symbols': [
             {
                 'symbol': row['symbol'],
+                'name': row['name'] or '',
+                'symbol_type': row['symbol_type'] or 'EQUITY',
                 'quotes': row['quotes'],
                 'first_date': row['first_date'] or 'N/A',
                 'last_date': row['last_date'] or 'N/A',
@@ -1555,18 +1557,18 @@ def show_statistics():
     """Show database statistics"""
     stats = get_statistics()
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*90}")
     print(f"Database: {stats['db_path']}")
     print(f"Total Quotes: {stats['total_quotes']:,}")
     print(f"Market Closures Detected: {stats['closure_count']}")
-    print(f"{'='*70}")
-    print(f"{'Symbol':<10} {'Quotes':>10} {'First Date':<12} {'Last Date':<12}")
-    print(f"{'-'*70}")
+    print(f"{'='*90}")
+    print(f"{'Symbol':<10} {'Type':<12} {'Quotes':>10} {'First Date':<12} {'Last Date':<12} {'Name'}")
+    print(f"{'-'*90}")
 
     for row in stats['symbols']:
-        print(f"{row['symbol']:<10} {row['quotes']:>10,} {row['first_date']:<12} {row['last_date']:<12}")
+        print(f"{row['symbol']:<10} {row['symbol_type']:<12} {row['quotes']:>10,} {row['first_date']:<12} {row['last_date']:<12} {row['name']}")
 
-    print(f"{'='*70}\n")
+    print(f"{'='*90}\n")
 
 def list_market_closures():
     """List all detected market closure dates"""
@@ -1813,12 +1815,14 @@ def get_stats_html():
     html_parts.append(f'<p>Total quotes: <strong>{stats["total_quotes"]:,}</strong> &nbsp;|&nbsp; ')
     html_parts.append(f'Market closures recorded: <strong>{stats["closure_count"]}</strong></p>\n')
     html_parts.append('<table>\n<thead><tr>\n')
-    html_parts.append('<th>Symbol</th><th class="num">Quotes</th><th>First Date</th><th>Last Date</th>\n')
+    html_parts.append('<th>Symbol</th><th>Type</th><th>Name</th><th class="num">Quotes</th><th>First Date</th><th>Last Date</th>\n')
     html_parts.append('</tr></thead>\n<tbody>\n')
 
     for row in stats['symbols']:
         html_parts.append('<tr>\n')
         html_parts.append(f'<td><strong>{row["symbol"]}</strong></td>\n')
+        html_parts.append(f'<td>{row["symbol_type"]}</td>\n')
+        html_parts.append(f'<td>{row["name"]}</td>\n')
         html_parts.append(f'<td class="num">{row["quotes"]:,}</td>\n')
         html_parts.append(f'<td>{row["first_date"]}</td>\n')
         html_parts.append(f'<td>{row["last_date"]}</td>\n')
