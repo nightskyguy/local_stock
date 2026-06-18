@@ -34,11 +34,20 @@ Usage:
     python stock_system.py --stats
     python stock_system.py --dbpath
 
+    # Money market funds
+    python stock_system.py --list-funds
+    python stock_system.py --rebuild-fund [SYMBOL]   # rebuild from stored metrics + verify
+    python stock_system.py --verify-fund [SYMBOL]    # verify only
+
 Web API:
     http://localhost:5000/quote/AAPL              - Latest close
     http://localhost:5000/quote/AAPL/now          - Live quote (cached 15min)
+    http://localhost:5000/quote/CSCO,TSLA,AAPL    - Batch latest close -> CSV (e.g. 70.1,421.5,267.6)
+    http://localhost:5000/quote/CSCO,TSLA,AAPL/now- Batch live quote -> CSV (missing -> #N/A)
     http://localhost:5000/quote/AAPL/2025-01-15   - Historical quote
+    http://localhost:5000/quote/CSCO,TSLA,AAPL/2025-01-15 - Batch historical close -> CSV (missing -> #N/A)
     http://localhost:5000/quote/AAPL/field/high   - Specific field
+    http://localhost:5000/funds                   - List money market (synthetic) funds
     http://localhost:5000/latest_date/AAPL        - Most recent date
 """
 
@@ -438,6 +447,53 @@ def get_tracked_symbols():
     symbols = [row['symbol'] for row in cursor.fetchall()]
     conn.close()
     return symbols
+
+def list_money_market_funds():
+    """
+    Return MONEY_MARKET symbols (the ones backed by a synthetic price series) with
+    their name, fund family, and synthetic-row coverage. A fund classified but not
+    yet built shows rows=0.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT s.symbol, s.name, s.fund_family,
+               COUNT(dq.quote_date) AS rows,
+               MAX(dq.quote_date) AS last_date
+        FROM symbols s
+        LEFT JOIN daily_quotes dq
+          ON dq.symbol = s.symbol AND dq.data_source = 'synthetic_mmf'
+        WHERE s.symbol_type = 'MONEY_MARKET'
+        GROUP BY s.symbol
+        ORDER BY s.symbol
+    ''')
+    funds = [
+        {
+            'symbol': r['symbol'],
+            'name': r['name'] or '',
+            'fund_family': r['fund_family'] or '',
+            'rows': r['rows'],
+            'last_date': r['last_date'] or 'N/A',
+        }
+        for r in cursor.fetchall()
+    ]
+    conn.close()
+    return funds
+
+def show_money_market_funds():
+    """Print a table of MONEY_MARKET funds and their synthetic-row coverage."""
+    funds = list_money_market_funds()
+    if not funds:
+        print("No money market funds (symbol_type='MONEY_MARKET') found.")
+        return
+    print(f"\n{'='*90}")
+    print(f"Money Market Funds (synthetic): {len(funds)}")
+    print(f"{'='*90}")
+    print(f"{'Symbol':<10} {'Rows':>8} {'Last Date':<12} {'Family':<22} {'Name'}")
+    print(f"{'-'*90}")
+    for f in funds:
+        print(f"{f['symbol']:<10} {f['rows']:>8,} {f['last_date']:<12} {f['fund_family']:<22} {f['name']}")
+    print(f"{'='*90}\n")
 
 def update_symbol_tracking(symbol):
     """Update first/last fetch dates for symbol"""
@@ -1076,12 +1132,14 @@ def save_quotes(quotes):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ''', (
                 quote['symbol'], quote['quote_date'],
-                round(quote.get('open'), 2) if quote.get('open') is not None else None,
-                round(quote.get('high'), 2) if quote.get('high') is not None else None,
-                round(quote.get('low'), 2) if quote.get('low') is not None else None,
-                round(quote.get('close'), 2) if quote.get('close') is not None else None,
+                # Store 6-dp precision so slow-growing synthetic ($1-based) series keep
+                # their daily gain; output is rounded to <=3 digits at the response layer.
+                round(quote.get('open'), 6) if quote.get('open') is not None else None,
+                round(quote.get('high'), 6) if quote.get('high') is not None else None,
+                round(quote.get('low'), 6) if quote.get('low') is not None else None,
+                round(quote.get('close'), 6) if quote.get('close') is not None else None,
                 int(quote.get('volume', 0)),
-                round(quote.get('dividends', 0), 2),
+                round(quote.get('dividends', 0), 6),
                 round(quote.get('stock_splits', 0), 4),  # Stock splits can be fractional
                 quote.get('data_source', 'unknown')
             ))
@@ -1170,7 +1228,7 @@ def fetch_mmf_yield_fred(symbol, start_date, end_date=None):
         metrics = []
         reader = _csv.DictReader(_io.StringIO(content))
         for row in reader:
-            date_str = row.get('DATE', '').strip()
+            date_str = row.get('observation_date', row.get('DATE', '')).strip()
             rate_str = row.get('DFF', '').strip()
             if not date_str or not rate_str or rate_str == '.':
                 continue
@@ -1216,11 +1274,41 @@ def save_fund_metrics(metrics_list):
     conn.close()
     return inserted
 
+def _synthetic_series_from_metrics(rows, start_price=1.0):
+    """
+    Compound daily yield into a total-return price series across calendar gaps.
+
+    rows: ordered iterable of (metric_date 'YYYY-MM-DD', yield_annual) ascending.
+    price[i] = price[i-1] * (1 + yield_annual[i] / 365) ** gap_days
+    where gap_days = (date[i] - date[i-1]).days. The first row is anchored at
+    start_price (no compounding applied to it).
+
+    Applying the exponent over the actual elapsed days credits weekends, holidays
+    and any missing observations, eliminating the under-compounding that occurs
+    when each row is treated as a single day. When all gaps are 1 day this reduces
+    to the simple per-row formula.
+
+    Returns a list of (metric_date, price) tuples.
+    """
+    series = []
+    price = start_price
+    prev_date = None
+    for date_str, yield_annual in rows:
+        cur_date = datetime.strptime(date_str, '%Y-%m-%d')
+        if prev_date is not None:
+            gap_days = (cur_date - prev_date).days
+            if gap_days < 1:
+                gap_days = 1
+            price *= (1.0 + (yield_annual or 0.0) / 365.0) ** gap_days
+        series.append((date_str, price))
+        prev_date = cur_date
+    return series
+
 def compute_synthetic_prices(symbol):
     """
     Compound daily yield into a total-return price series starting at $1.00.
     Returns daily_quotes-compatible dicts for all dates in fund_metrics.
-    price[t] = price[t-1] * (1 + yield_annual[t] / 365)
+    Compounding is gap-aware (see _synthetic_series_from_metrics).
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1229,26 +1317,24 @@ def compute_synthetic_prices(symbol):
         FROM fund_metrics WHERE symbol = ?
         ORDER BY metric_date ASC
     ''', (symbol.upper(),))
-    rows = cursor.fetchall()
+    rows = [(r['metric_date'], r['yield_annual']) for r in cursor.fetchall()]
     conn.close()
 
     if not rows:
         return []
 
+    yields = dict(rows)
     quotes = []
-    price = 1.0
-    for i, row in enumerate(rows):
-        if i > 0:
-            price *= (1.0 + (row['yield_annual'] or 0.0) / 365.0)
+    for date_str, price in _synthetic_series_from_metrics(rows):
         quotes.append({
             'symbol': symbol.upper(),
-            'quote_date': row['metric_date'],
+            'quote_date': date_str,
             'open': price,
             'high': price,
             'low': price,
             'close': price,
             'volume': 0,
-            'dividends': row['yield_annual'] or 0.0,
+            'dividends': yields.get(date_str) or 0.0,
             'stock_splits': 0.0,
             'data_source': 'synthetic_mmf',
         })
@@ -1265,6 +1351,129 @@ def rebuild_synthetic_prices(symbol):
     conn.commit()
     conn.close()
     return save_quotes(quotes)
+
+def verify_synthetic_prices(symbol, tolerance=1e-6):
+    """
+    Recompute the expected synthetic series from fund_metrics and compare it to the
+    stored daily_quotes synthetic rows. Read-only; does not modify the database.
+    Returns a report dict (see _print_verify_report for fields).
+    """
+    symbol = symbol.upper()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT metric_date, yield_annual FROM fund_metrics
+        WHERE symbol = ? ORDER BY metric_date ASC
+    ''', (symbol,))
+    metric_rows = [(r['metric_date'], r['yield_annual']) for r in cursor.fetchall()]
+    cursor.execute('''
+        SELECT quote_date, close FROM daily_quotes
+        WHERE symbol = ? AND data_source = 'synthetic_mmf'
+        ORDER BY quote_date ASC
+    ''', (symbol,))
+    stored = [(r['quote_date'], r['close']) for r in cursor.fetchall()]
+    conn.close()
+
+    report = {
+        'symbol': symbol,
+        'metric_count': len(metric_rows),
+        'stored_count': len(stored),
+    }
+    if not metric_rows:
+        report.update({'passed': False, 'error': 'no fund_metrics for symbol'})
+        return report
+    if not stored:
+        report.update({'passed': False, 'error': 'no synthetic rows stored (run --rebuild-fund)'})
+        return report
+
+    expected_by_date = dict(_synthetic_series_from_metrics(metric_rows))
+    stored_by_date = dict(stored)
+
+    first_price_ok = abs(stored[0][1] - 1.0) < tolerance if stored[0][1] is not None else False
+    count_ok = (len(stored) == len(metric_rows)
+                and set(stored_by_date) == {d for d, _ in metric_rows})
+    no_nulls = all(c is not None for _, c in stored)
+    monotonic_ok = all(stored[i][1] is not None and stored[i-1][1] is not None
+                       and stored[i][1] >= stored[i-1][1] - tolerance
+                       for i in range(1, len(stored)))
+
+    max_deviation = 0.0
+    for d, c in stored:
+        if c is None or d not in expected_by_date:
+            continue
+        dev = abs(c - expected_by_date[d])
+        if dev > max_deviation:
+            max_deviation = dev
+
+    d0 = datetime.strptime(stored[0][0], '%Y-%m-%d')
+    dN = datetime.strptime(stored[-1][0], '%Y-%m-%d')
+    span_days = (dN - d0).days
+    final_price = stored[-1][1]
+    implied_annual_return = None
+    if span_days > 0 and final_price and final_price > 0:
+        implied_annual_return = final_price ** (365.0 / span_days) - 1.0
+    mean_yield = sum((y or 0.0) for _, y in metric_rows) / len(metric_rows)
+
+    passed = (first_price_ok and count_ok and no_nulls and monotonic_ok
+              and max_deviation < 1e-5)
+
+    report.update({
+        'first_price_ok': first_price_ok,
+        'count_ok': count_ok,
+        'no_nulls': no_nulls,
+        'monotonic_ok': monotonic_ok,
+        'max_deviation': max_deviation,
+        'final_price': final_price,
+        'span_days': span_days,
+        'implied_annual_return': implied_annual_return,
+        'mean_yield': mean_yield,
+        'passed': passed,
+    })
+    return report
+
+def _print_verify_report(rep):
+    """Pretty-print a verify_synthetic_prices report dict."""
+    status = 'PASS' if rep.get('passed') else 'FAIL'
+    print(f"\n[{status}] {rep['symbol']} synthetic verification")
+    if 'error' in rep:
+        print(f"  error: {rep['error']}")
+        return
+    print(f"  metric rows / stored rows : {rep['metric_count']} / {rep['stored_count']}")
+    print(f"  first price == 1.0        : {rep['first_price_ok']}")
+    print(f"  count & dates match       : {rep['count_ok']}")
+    print(f"  no null closes            : {rep['no_nulls']}")
+    print(f"  monotonic non-decreasing  : {rep['monotonic_ok']}")
+    print(f"  max deviation vs recompute: {rep['max_deviation']:.2e}")
+    print(f"  final price               : {rep['final_price']:.6f}")
+    print(f"  span (days)               : {rep['span_days']}")
+    if rep['implied_annual_return'] is not None:
+        print(f"  implied annual return     : {rep['implied_annual_return']*100:.3f}%")
+    print(f"  mean annual yield         : {rep['mean_yield']*100:.3f}%")
+
+def rebuild_and_verify_fund(symbol):
+    """Rebuild a fund's synthetic series from stored metrics, then verify it."""
+    symbol = symbol.upper()
+    n = rebuild_synthetic_prices(symbol)
+    print(f"{symbol}: rebuilt {n} synthetic price records")
+    _print_verify_report(verify_synthetic_prices(symbol))
+
+def rebuild_and_verify_all_funds():
+    """Rebuild + verify every MONEY_MARKET fund."""
+    funds = list_money_market_funds()
+    if not funds:
+        print("No money market funds to rebuild.")
+        return
+    for f in funds:
+        rebuild_and_verify_fund(f['symbol'])
+
+def verify_all_funds():
+    """Verify (no rebuild) every MONEY_MARKET fund."""
+    funds = list_money_market_funds()
+    if not funds:
+        print("No money market funds to verify.")
+        return
+    for f in funds:
+        _print_verify_report(verify_synthetic_prices(f['symbol']))
 
 def update_synthetic_price_today(symbol):
     """Append new synthetic price rows since the last stored date."""
@@ -1304,16 +1513,21 @@ def update_synthetic_price_today(symbol):
     if not new_rows:
         return 0
 
-    price = last_price
+    # Anchor on the last stored row so the first new row compounds across the
+    # actual calendar gap (gap-aware, matching compute_synthetic_prices).
+    new_pairs = [(r['metric_date'], r['yield_annual']) for r in new_rows]
+    yields = dict(new_pairs)
+    anchored = _synthetic_series_from_metrics(
+        [(last_date, None)] + new_pairs, start_price=last_price)[1:]
+
     new_quotes = []
-    for row in new_rows:
-        price *= (1.0 + (row['yield_annual'] or 0.0) / 365.0)
+    for date_str, price in anchored:
         new_quotes.append({
             'symbol': symbol.upper(),
-            'quote_date': row['metric_date'],
+            'quote_date': date_str,
             'open': price, 'high': price, 'low': price, 'close': price,
             'volume': 0,
-            'dividends': row['yield_annual'] or 0.0,
+            'dividends': yields.get(date_str) or 0.0,
             'stock_splits': 0.0,
             'data_source': 'synthetic_mmf',
         })
@@ -1519,7 +1733,7 @@ def get_statistics():
     total_quotes = cursor.fetchone()['count']
 
     cursor.execute('''
-        SELECT s.symbol, COUNT(dq.quote_date) as quotes,
+        SELECT s.symbol, s.name, s.symbol_type, COUNT(dq.quote_date) as quotes,
                MIN(dq.quote_date) as first_date,
                MAX(dq.quote_date) as last_date
         FROM symbols s
@@ -1542,6 +1756,8 @@ def get_statistics():
         'symbols': [
             {
                 'symbol': row['symbol'],
+                'name': row['name'] or '',
+                'symbol_type': row['symbol_type'] or 'EQUITY',
                 'quotes': row['quotes'],
                 'first_date': row['first_date'] or 'N/A',
                 'last_date': row['last_date'] or 'N/A',
@@ -1555,18 +1771,18 @@ def show_statistics():
     """Show database statistics"""
     stats = get_statistics()
 
-    print(f"\n{'='*70}")
+    print(f"\n{'='*90}")
     print(f"Database: {stats['db_path']}")
     print(f"Total Quotes: {stats['total_quotes']:,}")
     print(f"Market Closures Detected: {stats['closure_count']}")
-    print(f"{'='*70}")
-    print(f"{'Symbol':<10} {'Quotes':>10} {'First Date':<12} {'Last Date':<12}")
-    print(f"{'-'*70}")
+    print(f"{'='*90}")
+    print(f"{'Symbol':<10} {'Type':<12} {'Quotes':>10} {'First Date':<12} {'Last Date':<12} {'Name'}")
+    print(f"{'-'*90}")
 
     for row in stats['symbols']:
-        print(f"{row['symbol']:<10} {row['quotes']:>10,} {row['first_date']:<12} {row['last_date']:<12}")
+        print(f"{row['symbol']:<10} {row['symbol_type']:<12} {row['quotes']:>10,} {row['first_date']:<12} {row['last_date']:<12} {row['name']}")
 
-    print(f"{'='*70}\n")
+    print(f"{'='*90}\n")
 
 def list_market_closures():
     """List all detected market closure dates"""
@@ -1620,6 +1836,51 @@ def import_closures_from_file(filename):
 # ============================================================================
 
 app = Flask(__name__)
+
+def fmt_price(v):
+    """Format a price for output: round to <=3 decimals, strip trailing zeros.
+    e.g. 123.3333 -> '123.333', 1.0010 -> '1.001', 123.0 -> '123'."""
+    return ('%.3f' % v).rstrip('0').rstrip('.')
+
+def _latest_close_value(symbol):
+    """Return latest stored close for a symbol as float, or None. No auto-fetch."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT close FROM daily_quotes
+        WHERE symbol = ? ORDER BY quote_date DESC LIMIT 1
+    ''', (symbol.upper(),))
+    row = cursor.fetchone()
+    conn.close()
+    return row['close'] if row and row['close'] is not None else None
+
+def _close_value_on_date(symbol, date):
+    """Return close on a date (or the nearest prior date) as float, or None. No auto-fetch.
+    Mirrors the exact-then-nearest-before logic of get_quote_helper."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT close FROM daily_quotes
+        WHERE symbol = ? AND quote_date = ?
+    ''', (symbol.upper(), date))
+    row = cursor.fetchone()
+    if not row or row['close'] is None:
+        cursor.execute('''
+            SELECT close FROM daily_quotes
+            WHERE symbol = ? AND quote_date <= ?
+            ORDER BY quote_date DESC LIMIT 1
+        ''', (symbol.upper(), date))
+        row = cursor.fetchone()
+    conn.close()
+    return row['close'] if row and row['close'] is not None else None
+
+@app.route('/funds')
+def list_funds_endpoint():
+    """List money market (synthetic) funds as JSON."""
+    try:
+        return jsonify(list_money_market_funds())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/export/<symbol>')
 @app.route('/export')
@@ -1813,12 +2074,14 @@ def get_stats_html():
     html_parts.append(f'<p>Total quotes: <strong>{stats["total_quotes"]:,}</strong> &nbsp;|&nbsp; ')
     html_parts.append(f'Market closures recorded: <strong>{stats["closure_count"]}</strong></p>\n')
     html_parts.append('<table>\n<thead><tr>\n')
-    html_parts.append('<th>Symbol</th><th class="num">Quotes</th><th>First Date</th><th>Last Date</th>\n')
+    html_parts.append('<th>Symbol</th><th>Type</th><th>Name</th><th class="num">Quotes</th><th>First Date</th><th>Last Date</th>\n')
     html_parts.append('</tr></thead>\n<tbody>\n')
 
     for row in stats['symbols']:
         html_parts.append('<tr>\n')
         html_parts.append(f'<td><strong>{row["symbol"]}</strong></td>\n')
+        html_parts.append(f'<td>{row["symbol_type"]}</td>\n')
+        html_parts.append(f'<td>{row["name"]}</td>\n')
         html_parts.append(f'<td class="num">{row["quotes"]:,}</td>\n')
         html_parts.append(f'<td>{row["first_date"]}</td>\n')
         html_parts.append(f'<td>{row["last_date"]}</td>\n')
@@ -1853,12 +2116,13 @@ def home():
     return f"<h1>Stock Quote Server (pid={os.getpid()})</h1>"+"""
     <h2>API Endpoints:</h2>
     <ul>
-        <li><code>/quote/&lt;symbol&gt;</code> - Latest close price (or compounded synthetic price for money market funds)</li>
-        <li><code>/quote/&lt;symbol&gt;/now</code> - Live quote (15min cache)</li>
-        <li><code>/quote/&lt;symbol&gt;/&lt;date&gt;</code> - Price on specific date (YYYY-MM-DD)</li>
+        <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]</code> - Latest close (synthetic price for MMFs). Comma list -> CSV, missing -> #N/A</li>
+        <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]/now</code> - Live quote, 15min cache. Comma list -> CSV, missing -> #N/A</li>
+        <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]/&lt;date&gt;</code> - Close on a date (YYYY-MM-DD). Comma list -> CSV, missing -> #N/A</li>
         <li><code>/quote/&lt;symbol&gt;/field/&lt;field&gt;</code> - Latest value for field (open, high, low, close, volume)</li>
         <li><code>/yield/&lt;symbol&gt;</code> - Latest annualized yield for money market funds</li>
         <li><code>/fund_type/&lt;symbol&gt;</code> - Asset type (EQUITY, ETF, MUTUALFUND, MONEY_MARKET, …)</li>
+        <li><a href="/funds"><code>/funds</code></a> - List money market (synthetic) funds</li>
         <li><code>/export/&lt;symbol&gt;</code> - Export all available quotes includes (open, high, low, close, volume)</li>
         <li><code>/latest_date/&lt;symbol&gt;</code> - Most recent date with data</li>
         <li><a href="/closures"><code>/closures</code></a> - List all detected market closure dates</li>
@@ -1871,8 +2135,11 @@ def home():
     <h2>Examples:</h2>
     <ul>
         <li><a href="/quote/AAPL">/quote/AAPL</a></li>
+        <li><a href="/quote/CSCO,QQQ,AAPL">/quote/CSCO,QQQ,AAPL</a> (batch CSV)</li>
         <li><a href="/quote/AAPL/now">/quote/AAPL/now</a></li>
+        <li><a href="/quote/CSCO,QQQ,AAPL/now">/quote/CSCO,QQQ,AAPL/now</a> (batch CSV)</li>
         <li><a href="/quote/CSCO/2025-01-15">/quote/CSCO/2025-01-15</a></li>
+        <li><a href="/quote/CSCO,QQQ,AAPL/2025-01-15">/quote/CSCO,QQQ,AAPL/2025-01-15</a> (batch CSV)</li>
         <li><a href="/quote/AAPL/field/high">/quote/AAPL/field/high</a></li>
         <li><a href="/export/QQQ">/export/QQQ</a> <B>Warning: Large amount of data</B> </li>
         <li><a href="/latest_date/AAPL">/latest_date/AAPL</a></li>
@@ -1880,6 +2147,9 @@ def home():
     <h2>Money Market Fund CLI:</h2>
     <ul>
         <li><code>python stock_system.py --add-fund FDLXX</code> - Add MMF and seed full yield history</li>
+        <li><code>python stock_system.py --list-funds</code> - List money market funds and synthetic coverage</li>
+        <li><code>python stock_system.py --rebuild-fund [SYMBOL]</code> - Rebuild synthetic prices from stored metrics and verify</li>
+        <li><code>python stock_system.py --verify-fund [SYMBOL]</code> - Verify synthetic price accuracy</li>
         <li><code>python stock_system.py --reclassify</code> - Reclassify all tracked symbols via yfinance</li>
     </ul>
     """
@@ -1942,7 +2212,15 @@ def view_config():
 
 @app.route('/quote/<symbol>')
 def get_quote_endpoint(symbol):
-    """Get latest close price"""
+    """Latest close for one symbol, or a CSV of latest closes for a comma-separated list.
+    Batch form (e.g. /quote/CSCO,TSLA,AAPL) does no auto-fetch; missing symbol -> #N/A."""
+    if ',' in symbol:
+        parts = [s.strip().upper() for s in symbol.split(',') if s.strip()]
+        out = []
+        for sym in parts:
+            v = _latest_close_value(sym)
+            out.append(fmt_price(v) if v is not None else '#N/A')
+        return ','.join(out)
     return get_quote_helper(symbol.upper(), field='close')
 
 
@@ -1954,28 +2232,46 @@ def list_closures():
 
 @app.route('/quote/<symbol>/now')
 def get_live_quote_endpoint(symbol):
-    """Get live quote with caching"""
+    """Live quote (cached) for one symbol, or a CSV of live quotes for a comma-separated
+    list. Batch form does no auto-fetch (it's the perf path); missing symbol -> #N/A."""
     try:
+        if ',' in symbol:
+            parts = [s.strip().upper() for s in symbol.split(',') if s.strip()]
+            out = []
+            for sym in parts:
+                price = get_live_quote(sym)
+                out.append(fmt_price(price) if price is not None else '#N/A')
+            return ','.join(out)
+
         price = get_live_quote(symbol.upper())
-        
+
         if price is not None:
-            return str(price)
+            return fmt_price(price)
         else:
             # Try auto-fetch if not in database
             if auto_fetch_symbol(symbol.upper()):
                 price = get_live_quote(symbol.upper())
                 if price:
-                    return str(price)
-            
+                    return fmt_price(price)
+
             return jsonify({'error': f'No data for {symbol.upper()}'}), 404
-    
+
     except Exception as e:
         logger.error(f"Error getting live quote for {symbol}: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/quote/<symbol>/<date>')
 def get_quote_by_date_endpoint(symbol, date):
-    """Get quote for specific date"""
+    """Close on a date for one symbol, or a CSV of closes for a comma-separated list.
+    Falls back to the nearest prior date per symbol. Batch form does no auto-fetch;
+    missing symbol -> #N/A."""
+    if ',' in symbol:
+        parts = [s.strip().upper() for s in symbol.split(',') if s.strip()]
+        out = []
+        for sym in parts:
+            v = _close_value_on_date(sym, date)
+            out.append(fmt_price(v) if v is not None else '#N/A')
+        return ','.join(out)
     return get_quote_helper(symbol.upper(), date=date, field='close')
 
 @app.route('/quote/<symbol>/field/<field>')
@@ -2069,9 +2365,9 @@ def get_quote_helper(symbol, date=None, field='close'):
             result = cursor.fetchone()
         
         conn.close()
-        
+
         if result and result[field] is not None:
-            return str(result[field])
+            return fmt_price(result[field])
         else:
             # Try auto-fetch for unknown symbols
             if auto_fetch_symbol(symbol):
@@ -2087,10 +2383,10 @@ def get_quote_helper(symbol, date=None, field='close'):
                 ''', (symbol,))
                 result = cursor.fetchone()
                 conn.close()
-                
+
                 if result and result[field] is not None:
-                    return str(result[field])
-            
+                    return fmt_price(result[field])
+
             return jsonify({'error': f'No data for {symbol}'}), 404
     
     except Exception as e:
@@ -2373,6 +2669,9 @@ def main():
     # Money market fund management
     parser.add_argument('--add-fund', type=str, metavar='SYMBOL', help='Add a money market fund and seed full yield history from FRED')
     parser.add_argument('--reclassify', action='store_true', help='Reclassify all tracked symbols via yfinance (run once after migration)')
+    parser.add_argument('--list-funds', action='store_true', help='List money market (synthetic) funds and their synthetic-row coverage')
+    parser.add_argument('--rebuild-fund', nargs='?', const='__ALL__', metavar='SYMBOL', help='Rebuild synthetic prices from stored FRED metrics and verify (no SYMBOL = all funds)')
+    parser.add_argument('--verify-fund', nargs='?', const='__ALL__', metavar='SYMBOL', help='Verify stored synthetic prices against recomputed series (no SYMBOL = all funds)')
     
     # Configuration
     parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY')
@@ -2425,6 +2724,24 @@ def main():
 
     if args.reclassify:
         reclassify_all_symbols()
+        return
+
+    if args.list_funds:
+        show_money_market_funds()
+        return
+
+    if args.rebuild_fund:
+        if args.rebuild_fund == '__ALL__':
+            rebuild_and_verify_all_funds()
+        else:
+            rebuild_and_verify_fund(args.rebuild_fund)
+        return
+
+    if args.verify_fund:
+        if args.verify_fund == '__ALL__':
+            verify_all_funds()
+        else:
+            _print_verify_report(verify_synthetic_prices(args.verify_fund))
         return
 
     if args.export:
