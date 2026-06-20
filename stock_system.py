@@ -23,7 +23,8 @@ Usage:
     python stock_system.py --exportcsv [filename=stock_system_export.csv] [SYMBOL]
     
     # Updates
-    python stock_system.py --update [--years N]
+    python stock_system.py --update [--years N]          # all symbols
+    python stock_system.py --update AOA [--years N]       # force-refresh one symbol (repairs missing OHLC)
     
     # Configuration
     python stock_system.py --config list
@@ -47,6 +48,10 @@ Web API:
     http://localhost:5000/quote/AAPL/2025-01-15   - Historical quote
     http://localhost:5000/quote/CSCO,TSLA,AAPL/2025-01-15 - Batch historical close -> CSV (missing -> #N/A)
     http://localhost:5000/quote/AAPL/field/high   - Specific field
+    http://localhost:5000/yield/FDLXX             - Latest annualized yield (bare, e.g. 0.0363)
+    http://localhost:5000/fund_type/AOA,QQQ       - Asset type(s) -> CSV (missing -> #N/A)
+    http://localhost:5000/name/AOA,QQQ            - Name(s) -> CSV (commas in name -> _, missing -> #N/A)
+    http://localhost:5000/update/AOA              - Force-refresh one symbol (repairs missing OHLC)
     http://localhost:5000/funds                   - List money market (synthetic) funds
     http://localhost:5000/latest_date/AAPL        - Most recent date
 """
@@ -1125,9 +1130,15 @@ def save_quotes(quotes):
     
     saved = 0
     for quote in quotes:
+        # Guard against partial/empty candles (e.g. yfinance NaN rows). Saving a
+        # null-close row would overwrite previously-good data via INSERT OR REPLACE.
+        # Skip it; the date stays "missing" and is retried on the next update.
+        if quote.get('close') is None:
+            logger.warning(f"Skipping {quote['symbol']} {quote['quote_date']}: null close")
+            continue
         try:
             cursor.execute('''
-                INSERT OR REPLACE INTO daily_quotes 
+                INSERT OR REPLACE INTO daily_quotes
                 (symbol, quote_date, open, high, low, close, volume, dividends, stock_splits, data_source, last_updated)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ''', (
@@ -1621,6 +1632,39 @@ def smart_update_symbol(symbol, years=None):
             logger.warning(f"No data fetched for {symbol} from {start_date} to {today}")
         return False
 
+def force_update_symbol(symbol, years=None):
+    """
+    Force-refresh a single symbol, overwriting existing rows in the window.
+    Unlike smart_update_symbol (which only fetches dates AFTER the last stored one),
+    this re-fetches a recent window so it can REPAIR rows with null OHLC.
+    - Money market funds: refresh synthetic price from FRED yield.
+    - Others: re-fetch lookback window (years*365 days if --years given, else ~7 days)
+      and save (INSERT OR REPLACE overwrites the window).
+    Returns True on success.
+    """
+    symbol = symbol.upper()
+    symbol_type = get_symbol_type(symbol)
+    if symbol_type == 'MONEY_MARKET':
+        update_synthetic_price_today(symbol)
+        update_symbol_tracking(symbol)
+        print(f"{symbol}: synthetic price refreshed")
+        return True
+
+    today = datetime.now().date()
+    lookback_days = years * 365 if years else 7
+    start_date = today - timedelta(days=lookback_days)
+    logger.info(f"Force-updating {symbol} from {start_date} to {today}")
+
+    quotes = fetch_data_multi_source(symbol, start_date.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d'))
+    if quotes:
+        saved = save_quotes(quotes)
+        update_symbol_tracking(symbol)
+        print(f"{symbol}: re-fetched {len(quotes)} rows, saved {saved}")
+        return True
+    print(f"{symbol}: no data fetched ({start_date} to {today})")
+    logger.warning(f"Force update fetched no data for {symbol}")
+    return False
+
 def update_all_symbols(years=None):
     """Update all active symbols"""
     symbols = get_tracked_symbols()
@@ -1842,6 +1886,11 @@ def fmt_price(v):
     e.g. 123.3333 -> '123.333', 1.0010 -> '1.001', 123.0 -> '123'."""
     return ('%.3f' % v).rstrip('0').rstrip('.')
 
+def fmt_yield(v):
+    """Format a yield fraction for output, keeping small magnitudes and trimming
+    float noise. e.g. 0.0363 -> '0.0363', 0.036300000000001 -> '0.0363'."""
+    return ('%.6f' % v).rstrip('0').rstrip('.')
+
 def _latest_close_value(symbol):
     """Return latest stored close for a symbol as float, or None. No auto-fetch."""
     conn = get_db_connection()
@@ -1979,12 +2028,7 @@ def get_yield_endpoint(symbol):
         row = cursor.fetchone()
         conn.close()
         if row and row['yield_annual'] is not None:
-            return jsonify({
-                'symbol': symbol.upper(),
-                'yield_annual': row['yield_annual'],
-                'date': row['metric_date'],
-                'source': row['yield_source']
-            })
+            return fmt_yield(row['yield_annual'])
         return jsonify({'error': f'No yield data for {symbol.upper()}'}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1992,7 +2036,19 @@ def get_yield_endpoint(symbol):
 
 @app.route('/fund_type/<symbol>')
 def get_fund_type_endpoint(symbol):
-    """Get asset type for a symbol"""
+    """Asset type for one symbol (JSON), or a CSV of types for a comma-separated list.
+    Batch form (e.g. /fund_type/AOA,QQQ) mirrors /quote; missing symbol -> #N/A."""
+    if ',' in symbol:
+        parts = [s.strip().upper() for s in symbol.split(',') if s.strip()]
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        out = []
+        for sym in parts:
+            cursor.execute('SELECT symbol_type FROM symbols WHERE symbol = ?', (sym,))
+            r = cursor.fetchone()
+            out.append((r['symbol_type'] or 'EQUITY') if r else '#N/A')
+        conn.close()
+        return ','.join(out)
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -2120,10 +2176,12 @@ def home():
         <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]/now</code> - Live quote, 15min cache. Comma list -> CSV, missing -> #N/A</li>
         <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]/&lt;date&gt;</code> - Close on a date (YYYY-MM-DD). Comma list -> CSV, missing -> #N/A</li>
         <li><code>/quote/&lt;symbol&gt;/field/&lt;field&gt;</code> - Latest value for field (open, high, low, close, volume)</li>
-        <li><code>/yield/&lt;symbol&gt;</code> - Latest annualized yield for money market funds</li>
-        <li><code>/fund_type/&lt;symbol&gt;</code> - Asset type (EQUITY, ETF, MUTUALFUND, MONEY_MARKET, …)</li>
+        <li><code>/yield/&lt;symbol&gt;</code> - Latest annualized yield (bare value, e.g. 0.0363)</li>
+        <li><code>/fund_type/&lt;symbol&gt;[,&lt;symbol&gt;...]</code> - Asset type (EQUITY, ETF, MUTUALFUND, MONEY_MARKET, …). Comma list -> CSV, missing -> #N/A</li>
+        <li><code>/name/&lt;symbol&gt;[,&lt;symbol&gt;...]</code> - Name(s) -> CSV; commas in a name become _, missing -> #N/A</li>
         <li><a href="/funds"><code>/funds</code></a> - List money market (synthetic) funds</li>
         <li><code>/export/&lt;symbol&gt;</code> - Export all available quotes includes (open, high, low, close, volume)</li>
+        <li><code>/update/&lt;symbol&gt;</code> - Force-refresh one symbol (repairs missing OHLC)</li>
         <li><code>/latest_date/&lt;symbol&gt;</code> - Most recent date with data</li>
         <li><a href="/closures"><code>/closures</code></a> - List all detected market closure dates</li>
         <li><a href="/config"><code>/config</code></a> - View configuration (read-only)</li>
@@ -2318,6 +2376,34 @@ def get_latest_date_endpoint(symbol):
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/update/<symbol>')
+def update_symbol_endpoint(symbol):
+    """Force-refresh a single symbol (repairs null-OHLC rows). Returns JSON status."""
+    try:
+        updated = force_update_symbol(symbol.upper())
+        return jsonify({'symbol': symbol.upper(), 'updated': bool(updated)})
+    except Exception as e:
+        logger.error(f"Error force-updating {symbol}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/name/<symbols>')
+def get_name_endpoint(symbols):
+    """CSV of names for one or more comma-separated symbols. Commas inside a name are
+    replaced with '_' so the CSV stays parseable; missing/unnamed -> #N/A."""
+    parts = [s.strip().upper() for s in symbols.split(',') if s.strip()]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    out = []
+    for sym in parts:
+        cursor.execute('SELECT name FROM symbols WHERE symbol = ?', (sym,))
+        r = cursor.fetchone()
+        if r and r['name']:
+            out.append(r['name'].replace(',', '_'))
+        else:
+            out.append('#N/A')
+    conn.close()
+    return ','.join(out)
 
 def get_quote_helper(symbol, date=None, field='close'):
     """Helper function to get quote data"""
@@ -2663,7 +2749,8 @@ def main():
 
 
     # Updates
-    parser.add_argument('--update', action='store_true', help='Update all symbols')
+    parser.add_argument('--update', nargs='?', const='__ALL__', metavar='SYMBOL',
+                        help='Update all symbols, or force-refresh one symbol (e.g. --update AOA)')
     parser.add_argument('--years', type=int, help='Years of history to fetch (for new symbols)')
 
     # Money market fund management
@@ -2715,7 +2802,10 @@ def main():
         return
     
     if args.update:
-        update_all_symbols(args.years)
+        if args.update == '__ALL__':
+            update_all_symbols(args.years)
+        else:
+            force_update_symbol(args.update.upper(), args.years)
         return
 
     if args.add_fund:
