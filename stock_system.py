@@ -87,6 +87,12 @@ LOG_PATH = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 
 # Reference symbols for market closure detection (must have 4+ years of data)
 REFERENCE_SYMBOLS = ['QQQ', 'CSCO']
 
+# Providers that don't carry these symbol types — skip them silently rather than logging 403 errors
+PROVIDER_SKIP_TYPES = {
+    'fmp':     {'MUTUALFUND', 'MONEY_MARKET', 'INDEX'},
+    'finnhub': {'MUTUALFUND', 'MONEY_MARKET', 'INDEX'},
+}
+
 # Holidays from finnhub
 MARKET_CLOSURES = [{'eventName': 'Christmas', 'atDate': '2027-12-24', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2027-11-26', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2027-11-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2027-09-06', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2027-07-05', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2027-06-18', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2027-05-31', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2027-03-26', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2027-02-15', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2027-01-18', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2027-01-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2026-12-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2026-12-24', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2026-11-27', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2026-11-26', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2026-09-07', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2026-07-03', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2026-06-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2026-05-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2026-04-03', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2026-02-16', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2026-01-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2026-01-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2025-12-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2025-12-24', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2025-11-28', 'tradingHour': '09:30-13:00', 'postMarket': '13:00:17:00'}, {'eventName': 'Thanksgiving Day', 'atDate': '2025-11-27', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2025-09-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2025-07-04', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2025-07-03', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2025-06-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2025-05-26', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2025-04-18', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2025-02-17', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2025-01-20', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'National Mourning Day', 'atDate': '2025-01-09', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2025-01-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2024-12-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas', 'atDate': '2024-12-24', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2024-11-29', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2024-11-28', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2024-09-02', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2024-07-04', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2024-07-03', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2024-06-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2024-05-27', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2024-03-29', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2024-02-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2024-01-15', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2024-01-01', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Christmas Day', 'atDate': '2023-12-25', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2023-11-24', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Thanksgiving Day', 'atDate': '2023-11-23', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Labor Day', 'atDate': '2023-09-04', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2023-07-04', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Independence Day', 'atDate': '2023-07-03', 'tradingHour': '09:30-13:00', 'postMarket': ''}, {'eventName': 'Juneteenth', 'atDate': '2023-06-19', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Memorial Day', 'atDate': '2023-05-29', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Good Friday', 'atDate': '2023-04-07', 'tradingHour': '', 'postMarket': ''}, {'eventName': "Washington's Birthday", 'atDate': '2023-02-20', 'tradingHour': '', 'postMarket': ''}, {'eventName': 'Birthday of Martin Luther King, Jr', 'atDate': '2023-01-16', 'tradingHour': '', 'postMarket': ''}, {'eventName': "New Year's Day", 'atDate': '2023-01-02', 'tradingHour': '', 'postMarket': ''}]
 
@@ -444,6 +450,28 @@ def remove_symbol(symbol):
     logger.info(f"Symbol removed: {symbol.upper()} ({quote_count} quotes deleted)")
     print(f"Removed {symbol.upper()} and {quote_count} quotes")
 
+def clean_orphan_symbols():
+    """Find and remove all active symbols that have zero quotes."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT s.symbol
+        FROM symbols s
+        LEFT JOIN daily_quotes dq ON dq.symbol = s.symbol
+        WHERE s.active = 1
+        GROUP BY s.symbol
+        HAVING COUNT(dq.quote_date) = 0
+        ORDER BY s.symbol
+    ''')
+    orphans = [row['symbol'] for row in cursor.fetchall()]
+    conn.close()
+    if not orphans:
+        print("No orphan symbols found (all tracked symbols have quotes).")
+        return
+    print(f"Orphan symbols with 0 quotes: {', '.join(orphans)}")
+    for sym in orphans:
+        remove_symbol(sym)
+
 def get_tracked_symbols():
     """Get list of active symbols"""
     conn = get_db_connection()
@@ -744,12 +772,19 @@ def get_enabled_sources():
 def fetch_data_multi_source(symbol, start_date, end_date):
     """Fetch data trying multiple sources with fallback"""
     sources = get_enabled_sources()
-    
+
     if not sources:
         logger.error("No enabled data sources configured")
         return None
-    
-    for source_name, api_key in sources:       
+
+    symbol_type = get_symbol_type(symbol)
+
+    for source_name, api_key in sources:
+        skip_types = PROVIDER_SKIP_TYPES.get(source_name, set())
+        if symbol_type in skip_types:
+            logger.info(f"{source_name}: skipping {symbol} (type {symbol_type} not supported by this provider)")
+            continue
+
         try:
             if source_name == 'yfinance':
                 quotes = fetch_yfinance(symbol, start_date, end_date)
@@ -757,16 +792,16 @@ def fetch_data_multi_source(symbol, start_date, end_date):
                 if not api_key:
                     logger.warning(f"{source_name}: Skipping - no API key configured")
                     continue
-                   
+
                 if source_name == 'alphavantage':
                     quotes = fetch_alphavantage(symbol, start_date, end_date, api_key)
-                        
+
                 elif source_name == 'fmp':
                     quotes = fetch_fmp(symbol, start_date, end_date, api_key)
-                        
+
                 elif source_name == 'finnhub':
                     quotes = fetch_finnhub(symbol, start_date, end_date, api_key)
-                        
+
                 else:
                     logger.warning(f"{source_name}: Unknown source: '{source_name}'")
                     continue
@@ -1577,10 +1612,10 @@ def add_money_market_fund(symbol, years=3):
 # SMART UPDATE LOGIC
 # ============================================================================
 
-def smart_update_symbol(symbol, years=None):
+def smart_update_symbol(symbol, years=None, since=None):
     """
     Smart update that only fetches missing data
-    - New symbols: fetch full history (years parameter or default)
+    - New symbols: fetch full history (since date, years parameter, or default)
     - Existing symbols: fetch from last date forward
     - Money market funds: update synthetic price from FRED yield
     """
@@ -1592,22 +1627,27 @@ def smart_update_symbol(symbol, years=None):
 
     last_date = get_last_date_for_symbol(symbol)
     today = datetime.now().date()
-    
+
     if last_date is None:
         # New symbol: fetch full history
-        if years is None:
-            years = int(get_config('default_years') or 3)
-        start_date = today - timedelta(days=365 * years)
-        logger.info(f"New symbol {symbol}: fetching {years} years of history")
+        if since:
+            from datetime import date as _date
+            start_date = _date.fromisoformat(since)
+            logger.info(f"New symbol {symbol}: fetching from {since}")
+        else:
+            if years is None:
+                years = int(get_config('default_years') or 3)
+            start_date = today - timedelta(days=365 * years)
+            logger.info(f"New symbol {symbol}: fetching {years} years of history")
     else:
         # Existing symbol: fetch from last date + 1
         start_date = last_date + timedelta(days=1)
-        
+
         # If already current, skip
         if start_date > today:
             logger.info(f"{symbol} already up to date (last: {last_date})")
             return True
-        
+
         logger.info(f"Updating {symbol} from {start_date} to {today}")
     
     # Fetch data
@@ -1632,14 +1672,14 @@ def smart_update_symbol(symbol, years=None):
             logger.warning(f"No data fetched for {symbol} from {start_date} to {today}")
         return False
 
-def force_update_symbol(symbol, years=None):
+def force_update_symbol(symbol, years=None, since=None):
     """
     Force-refresh a single symbol, overwriting existing rows in the window.
     Unlike smart_update_symbol (which only fetches dates AFTER the last stored one),
-    this re-fetches a recent window so it can REPAIR rows with null OHLC.
+    this re-fetches a window so it can REPAIR rows with null OHLC and backfill gaps.
     - Money market funds: refresh synthetic price from FRED yield.
-    - Others: re-fetch lookback window (years*365 days if --years given, else ~7 days)
-      and save (INSERT OR REPLACE overwrites the window).
+    - Others: re-fetch from --since date, or years*365 days back, or 7 days (default).
+      INSERT OR REPLACE overwrites the window.
     Returns True on success.
     """
     symbol = symbol.upper()
@@ -1651,9 +1691,14 @@ def force_update_symbol(symbol, years=None):
         return True
 
     today = datetime.now().date()
-    lookback_days = years * 365 if years else 7
-    start_date = today - timedelta(days=lookback_days)
-    logger.info(f"Force-updating {symbol} from {start_date} to {today}")
+    if since:
+        from datetime import date as _date
+        start_date = _date.fromisoformat(since)
+        logger.info(f"Force-updating {symbol} from {since} (--since) to {today}")
+    else:
+        lookback_days = years * 365 if years else 7
+        start_date = today - timedelta(days=lookback_days)
+        logger.info(f"Force-updating {symbol} from {start_date} to {today}")
 
     quotes = fetch_data_multi_source(symbol, start_date.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d'))
     if quotes:
@@ -1665,24 +1710,24 @@ def force_update_symbol(symbol, years=None):
     logger.warning(f"Force update fetched no data for {symbol}")
     return False
 
-def update_all_symbols(years=None):
+def update_all_symbols(years=None, since=None):
     """Update all active symbols"""
     symbols = get_tracked_symbols()
-    
+
     if not symbols:
         print("No symbols to update")
         logger.warning("No symbols to update")
         return
-    
+
     print(f"Updating {len(symbols)} symbols...")
     logger.info(f"Starting update for {len(symbols)} symbols")
-    
+
     success_count = 0
     for i, symbol in enumerate(symbols, 1):
         print(f"[{i}/{len(symbols)}] Updating {symbol}...")
-        if smart_update_symbol(symbol, years):
+        if smart_update_symbol(symbol, years, since=since):
             success_count += 1
-    
+
     print(f"\nUpdate complete: {success_count}/{len(symbols)} symbols updated successfully")
     logger.info(f"Update complete: {success_count}/{len(symbols)} successful")
 
@@ -2742,7 +2787,8 @@ def main():
     # Symbol management
     parser.add_argument('--init', action='store_true', help='Initialize database')
     parser.add_argument('--add', action='append', help='Add symbol(s) - can use multiple times')
-    parser.add_argument('--remove', type=str, help='Remove symbol')
+    parser.add_argument('--remove', nargs='?', const='__CLEAN__', metavar='SYMBOL',
+                        help='Remove a symbol and its data. Without SYMBOL: find and remove all symbols with 0 quotes.')
     parser.add_argument('--export', '--exportcsv', action='store_true', help='Export to CSV')
     parser.add_argument('--filename', type=str, default='stock_system_quotes.csv', help='CSV output filename (default: stock_system_quotes.csv)')
     parser.add_argument('--symbol', type=str, help='Symbol to export eg "QQQ" (default: all symbols)')    
@@ -2752,6 +2798,9 @@ def main():
     parser.add_argument('--update', nargs='?', const='__ALL__', metavar='SYMBOL',
                         help='Update all symbols, or force-refresh one symbol (e.g. --update AOA)')
     parser.add_argument('--years', type=int, help='Years of history to fetch (for new symbols)')
+    parser.add_argument('--since', type=str, metavar='DATE',
+                        help='Absolute start date for fetch (YYYY-MM-DD). Overrides --years. '
+                             'Use with --update to backfill gaps (e.g. --update USFR --since 2023-01-01)')
 
     # Money market fund management
     parser.add_argument('--add-fund', type=str, metavar='SYMBOL', help='Add a money market fund and seed full yield history from FRED')
@@ -2794,18 +2843,24 @@ def main():
     
     if args.add:
         for symbol in args.add:
-            add_symbol(symbol)
+            added = add_symbol(symbol)
+            if added and args.since:
+                print(f"  Seeding history from {args.since}...")
+                smart_update_symbol(symbol.upper(), since=args.since)
         return
     
     if args.remove:
-        remove_symbol(args.remove)
+        if args.remove == '__CLEAN__':
+            clean_orphan_symbols()
+        else:
+            remove_symbol(args.remove)
         return
-    
+
     if args.update:
         if args.update == '__ALL__':
-            update_all_symbols(args.years)
+            update_all_symbols(args.years, since=args.since)
         else:
-            force_update_symbol(args.update.upper(), args.years)
+            force_update_symbol(args.update.upper(), args.years, since=args.since)
         return
 
     if args.add_fund:
