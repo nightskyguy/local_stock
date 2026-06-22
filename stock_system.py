@@ -1920,6 +1920,21 @@ def import_closures_from_file(filename):
 
     print(f"Import complete: {imported} closures imported, {skipped} lines skipped.")
 
+def import_closures_from_builtin():
+    """Seed market_closures table from the MARKET_CLOSURES constant in this file."""
+    imported = 0
+    for entry in MARKET_CLOSURES:
+        date_str = entry.get('atDate', '').strip()
+        if not date_str:
+            continue
+        reason = entry.get('eventName', '')
+        hours = entry.get('tradingHour', '')
+        if hours:
+            reason = f"{reason} (early close {hours})" if reason else f"Early close {hours}"
+        mark_market_closure(date_str, reason or None)
+        imported += 1
+    print(f"Import complete: {imported} closures seeded from built-in MARKET_CLOSURES.")
+
 # ============================================================================
 # WEB SERVER
 # ============================================================================
@@ -2816,8 +2831,8 @@ def main():
     parser.add_argument('--stats', '--statistics', action='store_true', help='Show database statistics')
     parser.add_argument('--dbpath', action='store_true', help='Show database path')
     parser.add_argument('--closures', action='store_true', help='List all market closure dates')
-    parser.add_argument('--import-closures', type=str, metavar='FILE',
-                        help='Import market closures from CSV file (DATE[,REASON] per line, # for comments)')
+    parser.add_argument('--import-closures', nargs='?', const='__BUILTIN__', metavar='FILE',
+                        help='Import market closures from CSV file (DATE[,REASON] per line, # for comments). Without FILE: seed from built-in MARKET_CLOSURES list.')
     
     args = parser.parse_args()
     
@@ -2944,7 +2959,10 @@ def main():
         return
 
     if args.import_closures:
-        import_closures_from_file(args.import_closures)
+        if args.import_closures == '__BUILTIN__':
+            import_closures_from_builtin()
+        else:
+            import_closures_from_file(args.import_closures)
         return
 
     if args.dbpath:
