@@ -120,6 +120,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# yfinance logs "possibly delisted" at ERROR when a ticker returns no data for a
+# date range — this is expected and non-actionable for mutual funds and recent gaps.
+# Downgrade those messages to DEBUG so they don't pollute the log.
+class _YFinanceDelistedFilter(logging.Filter):
+    def filter(self, record):
+        if record.levelno >= logging.ERROR and 'possibly delisted' in record.getMessage():
+            record.levelno = logging.DEBUG
+            record.levelname = 'DEBUG'
+        return True
+
+_yf_filter = _YFinanceDelistedFilter()
+for _yf_logger_name in ('yfinance', 'yfinance.base', 'yfinance.ticker'):
+    logging.getLogger(_yf_logger_name).addFilter(_yf_filter)
+
 # Global database path (can be overridden by --db argument)
 DB_PATH = DEFAULT_DB_PATH
 
