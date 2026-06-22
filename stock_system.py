@@ -47,7 +47,8 @@ Web API:
     http://localhost:5000/quote/CSCO,TSLA,AAPL/now- Batch live quote -> CSV (missing -> #N/A)
     http://localhost:5000/quote/AAPL/2025-01-15   - Historical quote
     http://localhost:5000/quote/CSCO,TSLA,AAPL/2025-01-15 - Batch historical close -> CSV (missing -> #N/A)
-    http://localhost:5000/quote/AAPL/field/high   - Specific field
+    http://localhost:5000/quote/AAPL/field/high   - Specific field (OHLCV)
+    http://localhost:5000/quote/AAPL/field/pe     - Fundamentals: pe, pe_forward, xr, divyield (batch -> CSV)
     http://localhost:5000/yield/FDLXX             - Latest annualized yield (bare, e.g. 0.0363)
     http://localhost:5000/fund_type/AOA,QQQ       - Asset type(s) -> CSV (missing -> #N/A)
     http://localhost:5000/name/AOA,QQQ            - Name(s) -> CSV (commas in name -> _, missing -> #N/A)
@@ -243,6 +244,26 @@ def setup_database():
         ON fund_metrics(symbol, metric_date DESC)
     ''')
 
+    # Symbol fundamentals table (P/E, dividend yield, expense ratio snapshots)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS symbol_fundamentals (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol         TEXT NOT NULL,
+            snapshot_date  TEXT NOT NULL,
+            pe_trailing    REAL,
+            pe_forward     REAL,
+            dividend_yield REAL,
+            expense_ratio  REAL,
+            data_source    TEXT,
+            last_updated   TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, snapshot_date)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_symbol_fundamentals_symbol_date
+        ON symbol_fundamentals(symbol, snapshot_date DESC)
+    ''')
+
     conn.commit()
     conn.close()
     migrate_schema()
@@ -277,6 +298,25 @@ def migrate_schema():
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_fund_metrics_symbol_date
         ON fund_metrics(symbol, metric_date DESC)
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS symbol_fundamentals (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol         TEXT NOT NULL,
+            snapshot_date  TEXT NOT NULL,
+            pe_trailing    REAL,
+            pe_forward     REAL,
+            dividend_yield REAL,
+            expense_ratio  REAL,
+            data_source    TEXT,
+            last_updated   TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, snapshot_date)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_symbol_fundamentals_symbol_date
+        ON symbol_fundamentals(symbol, snapshot_date DESC)
     ''')
 
     cursor.execute("PRAGMA table_info(market_closures)")
@@ -758,6 +798,102 @@ def fetch_live_quote_yfinance(symbol):
     except Exception as e:
         logger.error(f"Live quote fetch failed for {symbol}: {e}")
         return None
+
+def _extract_dividend_yield(info):
+    """Return dividend yield as a fraction (e.g. 0.0035 = 0.35%), or None.
+    Prefer `trailingAnnualDividendYield`, which yfinance reports as a fraction
+    consistently across versions. Fall back to `dividendYield`, which newer yfinance
+    reports as a percent (e.g. 0.36) — normalize by dividing when it dwarfs the trailing
+    fraction or exceeds 1."""
+    tady = info.get('trailingAnnualDividendYield')
+    if tady is not None:
+        try:
+            return float(tady)
+        except (TypeError, ValueError):
+            pass
+    dy = info.get('dividendYield')
+    if dy is None:
+        return None
+    try:
+        v = float(dy)
+    except (TypeError, ValueError):
+        return None
+    # No trailing fraction to anchor against: dividendYield is a percent in current
+    # yfinance, so scale to a fraction.
+    return v / 100.0
+
+def fetch_fundamentals_yfinance(symbol):
+    """Fetch P/E, dividend yield and expense ratio for a symbol from yfinance.
+    One .info call; returns a fundamentals record dict (None for absent keys)."""
+    try:
+        info = yf.Ticker(symbol).info
+        expense = (info.get('annualReportExpenseRatio')
+                   or info.get('netExpenseRatio')
+                   or info.get('expenseRatio'))
+        record = {
+            'symbol': symbol.upper(),
+            'snapshot_date': datetime.now().strftime('%Y-%m-%d'),
+            'pe_trailing': info.get('trailingPE'),
+            'pe_forward': info.get('forwardPE'),
+            'dividend_yield': _extract_dividend_yield(info),
+            'expense_ratio': float(expense) if expense is not None else None,
+            'data_source': 'yfinance',
+        }
+        return record
+    except Exception as e:
+        logger.error(f"Fundamentals fetch failed for {symbol}: {e}")
+        return None
+
+def save_fundamentals(records):
+    """Batch-save fundamentals records to symbol_fundamentals table."""
+    if not records:
+        return 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    inserted = 0
+    for r in records:
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO symbol_fundamentals
+                (symbol, snapshot_date, pe_trailing, pe_forward,
+                 dividend_yield, expense_ratio, data_source, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (r['symbol'], r['snapshot_date'], r.get('pe_trailing'),
+                  r.get('pe_forward'), r.get('dividend_yield'),
+                  r.get('expense_ratio'), r['data_source']))
+            inserted += 1
+        except Exception as e:
+            logger.error(f"Error saving fundamentals {r['symbol']} {r['snapshot_date']}: {e}")
+    conn.commit()
+    conn.close()
+    return inserted
+
+def update_fundamentals(symbols=None):
+    """Fetch and store fundamentals snapshots. `symbols` may be None (all tracked
+    symbols), a single symbol string, or a list of symbols."""
+    if symbols is None:
+        symbols = get_tracked_symbols()
+    elif isinstance(symbols, str):
+        symbols = [symbols]
+    symbols = [s.strip().upper() for s in symbols if s and s.strip()]
+
+    if not symbols:
+        print("No symbols to update")
+        logger.warning("No symbols for fundamentals update")
+        return
+
+    print(f"Updating fundamentals for {len(symbols)} symbol(s)...")
+    logger.info(f"Starting fundamentals update for {len(symbols)} symbols")
+
+    success_count = 0
+    for i, symbol in enumerate(symbols, 1):
+        print(f"[{i}/{len(symbols)}] Fundamentals {symbol}...")
+        record = fetch_fundamentals_yfinance(symbol)
+        if record and save_fundamentals([record]):
+            success_count += 1
+
+    print(f"\nFundamentals update complete: {success_count}/{len(symbols)} updated")
+    logger.info(f"Fundamentals update complete: {success_count}/{len(symbols)} successful")
 
 def get_enabled_sources():
     """
@@ -1977,6 +2113,19 @@ def _latest_close_value(symbol):
     conn.close()
     return row['close'] if row and row['close'] is not None else None
 
+def _latest_field_value(symbol, field):
+    """Return latest stored OHLCV field for a symbol as float, or None. No auto-fetch.
+    `field` must be one of open/high/low/close/volume (caller-validated)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f'''
+        SELECT {field} AS val FROM daily_quotes
+        WHERE symbol = ? ORDER BY quote_date DESC LIMIT 1
+    ''', (symbol.upper(),))
+    row = cursor.fetchone()
+    conn.close()
+    return row['val'] if row and row['val'] is not None else None
+
 def _close_value_on_date(symbol, date):
     """Return close on a date (or the nearest prior date) as float, or None. No auto-fetch.
     Mirrors the exact-then-nearest-before logic of get_quote_helper."""
@@ -2249,7 +2398,7 @@ def home():
         <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]</code> - Latest close (synthetic price for MMFs). Comma list -> CSV, missing -> #N/A</li>
         <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]/now</code> - Live quote, 15min cache. Comma list -> CSV, missing -> #N/A</li>
         <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]/&lt;date&gt;</code> - Close on a date (YYYY-MM-DD). Comma list -> CSV, missing -> #N/A</li>
-        <li><code>/quote/&lt;symbol&gt;/field/&lt;field&gt;</code> - Latest value for field (open, high, low, close, volume)</li>
+        <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]/field/&lt;field&gt;</code> - Latest value for field. OHLCV: open, high, low, close, volume. Fundamentals: pe, pe_forward, xr (expense ratio), divyield. Comma list -> CSV, missing -> #N/A</li>
         <li><code>/yield/&lt;symbol&gt;</code> - Latest annualized yield (bare value, e.g. 0.0363)</li>
         <li><code>/fund_type/&lt;symbol&gt;[,&lt;symbol&gt;...]</code> - Asset type (EQUITY, ETF, MUTUALFUND, MONEY_MARKET, …). Comma list -> CSV, missing -> #N/A</li>
         <li><code>/name/&lt;symbol&gt;[,&lt;symbol&gt;...]</code> - Name(s) -> CSV; commas in a name become _, missing -> #N/A</li>
@@ -2273,6 +2422,8 @@ def home():
         <li><a href="/quote/CSCO/2025-01-15">/quote/CSCO/2025-01-15</a></li>
         <li><a href="/quote/CSCO,QQQ,AAPL/2025-01-15">/quote/CSCO,QQQ,AAPL/2025-01-15</a> (batch CSV)</li>
         <li><a href="/quote/AAPL/field/high">/quote/AAPL/field/high</a></li>
+        <li><a href="/quote/AAPL/field/pe">/quote/AAPL/field/pe</a> (trailing P/E)</li>
+        <li><a href="/quote/AAPL,MSFT,VOO/field/divyield">/quote/AAPL,MSFT,VOO/field/divyield</a> (batch CSV)</li>
         <li><a href="/export/QQQ">/export/QQQ</a> <B>Warning: Large amount of data</B> </li>
         <li><a href="/latest_date/AAPL">/latest_date/AAPL</a></li>
     </ul>
@@ -2406,13 +2557,64 @@ def get_quote_by_date_endpoint(symbol, date):
         return ','.join(out)
     return get_quote_helper(symbol.upper(), date=date, field='close')
 
+# Fundamental field name -> symbol_fundamentals column.
+FUNDAMENTAL_FIELDS = {
+    'pe': 'pe_trailing',
+    'pe_forward': 'pe_forward',
+    'xr': 'expense_ratio',
+    'divyield': 'dividend_yield',
+}
+
+def _fundamental_value(symbol, column):
+    """Return the latest stored fundamental value for a symbol, or None."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f'''
+        SELECT {column} AS val
+        FROM symbol_fundamentals
+        WHERE symbol = ?
+        ORDER BY snapshot_date DESC
+        LIMIT 1
+    ''', (symbol.upper(),))
+    row = cursor.fetchone()
+    conn.close()
+    return row['val'] if row and row['val'] is not None else None
+
 @app.route('/quote/<symbol>/field/<field>')
 def get_quote_by_field_endpoint(symbol, field):
-    """Get latest value for specific field"""
-    valid_fields = ['open', 'high', 'low', 'close', 'volume']
-    if field.lower() not in valid_fields:
-        return jsonify({'error': f'Invalid field. Must be one of: {", ".join(valid_fields)}'}), 400
-    return get_quote_helper(symbol.upper(), field=field.lower())
+    """Latest value for a specific field. OHLCV fields come from daily quotes;
+    fundamental fields (pe, pe_forward, xr, divyield) come from symbol_fundamentals.
+    A comma-separated symbol list returns a CSV (missing -> #N/A), mirroring /quote."""
+    field = field.lower()
+    ohlcv_fields = ['open', 'high', 'low', 'close', 'volume']
+
+    if field in FUNDAMENTAL_FIELDS:
+        column = FUNDAMENTAL_FIELDS[field]
+        fmt = fmt_yield if field in ('xr', 'divyield') else fmt_price
+        if ',' in symbol:
+            parts = [s.strip().upper() for s in symbol.split(',') if s.strip()]
+            out = []
+            for sym in parts:
+                v = _fundamental_value(sym, column)
+                out.append(fmt(v) if v is not None else '#N/A')
+            return ','.join(out)
+        v = _fundamental_value(symbol.upper(), column)
+        if v is not None:
+            return fmt(v)
+        return jsonify({'error': f'No {field} data for {symbol.upper()}'}), 404
+
+    if field not in ohlcv_fields:
+        valid = ohlcv_fields + list(FUNDAMENTAL_FIELDS.keys())
+        return jsonify({'error': f'Invalid field. Must be one of: {", ".join(valid)}'}), 400
+
+    if ',' in symbol:
+        parts = [s.strip().upper() for s in symbol.split(',') if s.strip()]
+        out = []
+        for sym in parts:
+            v = _latest_field_value(sym, field)
+            out.append(fmt_price(v) if v is not None else '#N/A')
+        return ','.join(out)
+    return get_quote_helper(symbol.upper(), field=field)
 
 @app.route('/latest_date/<symbol>')
 def get_latest_date_endpoint(symbol):
@@ -2826,6 +3028,10 @@ def main():
     # Updates
     parser.add_argument('--update', nargs='?', const='__ALL__', metavar='SYMBOL',
                         help='Update all symbols, or force-refresh one symbol (e.g. --update AOA)')
+    parser.add_argument('--update-fundamentals', nargs='?', const='__ALL__', metavar='SYMBOLS',
+                        help='Fetch P/E, dividend yield, expense ratio from yfinance. No value = '
+                             'all tracked symbols; one symbol or a comma-separated list '
+                             '(e.g. --update-fundamentals AAPL,MSFT,VOO)')
     parser.add_argument('--years', type=int, help='Years of history to fetch (for new symbols)')
     parser.add_argument('--since', type=str, metavar='DATE',
                         help='Absolute start date for fetch (YYYY-MM-DD). Overrides --years. '
@@ -2890,6 +3096,14 @@ def main():
             update_all_symbols(args.years, since=args.since)
         else:
             force_update_symbol(args.update.upper(), args.years, since=args.since)
+        return
+
+    if args.update_fundamentals:
+        if args.update_fundamentals == '__ALL__':
+            update_fundamentals(None)
+        else:
+            syms = [s.strip().upper() for s in args.update_fundamentals.split(',') if s.strip()]
+            update_fundamentals(syms)
         return
 
     if args.add_fund:
