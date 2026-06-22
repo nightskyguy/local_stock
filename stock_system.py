@@ -218,6 +218,7 @@ def setup_database():
             source_name TEXT PRIMARY KEY,
             api_key TEXT,
             rate_limit INTEGER,
+            enabled INTEGER DEFAULT 1,
             priority INTEGER DEFAULT 99,
             notes TEXT
         )
@@ -284,6 +285,11 @@ def migrate_schema():
     if 'reason' not in mc_cols:
         cursor.execute("ALTER TABLE market_closures ADD COLUMN reason TEXT")
 
+    cursor.execute("PRAGMA table_info(data_sources)")
+    ds_cols = {row[1] for row in cursor.fetchall()}
+    if ds_cols and 'enabled' not in ds_cols:
+        cursor.execute("ALTER TABLE data_sources ADD COLUMN enabled INTEGER DEFAULT 1")
+
     conn.commit()
     conn.close()
 
@@ -316,7 +322,7 @@ def initialize_data_sources():
     
     for source in sources:
         cursor.execute('''
-            INSERT OR IGNORE INTO data_sources (source_name, api_key, rate_limit, priority, notes)
+            INSERT OR IGNORE INTO data_sources (source_name, api_key, rate_limit, enabled, priority, notes)
             VALUES (?, ?, ?, ?, ?, ?)
         ''', source)
     
