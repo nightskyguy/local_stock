@@ -91,9 +91,13 @@ __version__ = '1.1.0'
 
 CHANGELOG = [
     {'version': '1.1.0', 'date': '2026-07-01', 'changes': [
-        'Add watch list monitor (/watchlist route + --watchlist CLI): flag symbols down >loss-pct% vs 1wk/1mo/YTD close',
+        'Fix /quote/<symbol>/now returning "1" for money-market funds (now returns the synthetic price)',
+        'Add watch list monitor (/watchlist route + --watchlist CLI): flag symbols down >loss-pct% (default 12%) '
+        'and/or up >gain-pct% vs 1wk/1mo/YTD close',
         'Add /chart route: multi-symbol Chart.js line chart with configurable time span',
         'Add version/changelog reporting via --version CLI flag and /version route',
+        'Add --secondary/--port: run a second test server instance alongside the primary, with its own '
+        'lock/port/log files, stoppable independently via --stop --secondary',
     ]},
 ]
 
@@ -103,6 +107,7 @@ CHANGELOG = [
 
 DEFAULT_DB_PATH = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_quotes.db')
 LOG_PATH = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system.log')
+LOG_PATH_SECONDARY = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system_secondary.log')
 
 # Reference symbols for market closure detection (must have 4+ years of data)
 REFERENCE_SYMBOLS = ['QQQ', 'CSCO']
@@ -139,6 +144,16 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def use_secondary_log_file():
+    """Redirect logging to LOG_PATH_SECONDARY instead of LOG_PATH, so a --secondary
+    instance doesn't interleave its log lines with the primary's."""
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+    file_handler = logging.FileHandler(LOG_PATH_SECONDARY)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    root.addHandler(file_handler)
 
 # yfinance logs "possibly delisted" at ERROR when a ticker returns no data for a
 # date range — this is expected and non-actionable for mutual funds and recent gaps.
@@ -3361,11 +3376,14 @@ def main():
                         help='Gain percent threshold for --watchlist (default: none, upside not checked)')
 
     args = parser.parse_args()
-    
+
     # Set database path if provided
     if args.db:
         DB_PATH = args.db
-    
+
+    if args.secondary:
+        use_secondary_log_file()
+
     # Handle --stopserver FIRST (before other commands)
     if args.shutdown:
         stop_server(args.secondary)
