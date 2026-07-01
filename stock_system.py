@@ -1818,17 +1818,19 @@ def smart_update_symbol(symbol, years=None, since=None):
     last_date = get_last_date_for_symbol(symbol)
     today = datetime.now().date()
 
-    if last_date is None:
+    if since:
+        # Explicit --since always wins, whether the symbol is new or already
+        # has data - otherwise a backfill request against an existing symbol
+        # would silently be ignored in favor of the last-date+1 forward fetch.
+        from datetime import date as _date
+        start_date = _date.fromisoformat(since)
+        logger.info(f"{symbol}: fetching from {since} (--since override)")
+    elif last_date is None:
         # New symbol: fetch full history
-        if since:
-            from datetime import date as _date
-            start_date = _date.fromisoformat(since)
-            logger.info(f"New symbol {symbol}: fetching from {since}")
-        else:
-            if years is None:
-                years = int(get_config('default_years') or 3)
-            start_date = today - timedelta(days=365 * years)
-            logger.info(f"New symbol {symbol}: fetching {years} years of history")
+        if years is None:
+            years = int(get_config('default_years') or 3)
+        start_date = today - timedelta(days=365 * years)
+        logger.info(f"New symbol {symbol}: fetching {years} years of history")
     else:
         # Existing symbol: fetch from last date + 1
         start_date = last_date + timedelta(days=1)
