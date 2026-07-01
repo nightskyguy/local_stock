@@ -66,7 +66,7 @@ from datetime import datetime, timedelta
 import time
 import yfinance as yf
 import pandas as pd
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 import threading
 import socket
@@ -77,6 +77,25 @@ from zoneinfo import ZoneInfo
 # Get Lock File with PID (if it exists)
 LOCK_FILE = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system.lock')
 SERVER_PORT_FILE = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system.port')
+
+# Separate lock/port files for a --secondary test instance, so it can run
+# alongside the primary server and be stopped independently (--stop --secondary).
+LOCK_FILE_SECONDARY = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system_secondary.lock')
+SERVER_PORT_FILE_SECONDARY = os.path.join(os.environ.get('USERPROFILE', os.path.expanduser('~')), 'stock_system_secondary.port')
+
+# ============================================================================
+# VERSION
+# ============================================================================
+
+__version__ = '1.1.0'
+
+CHANGELOG = [
+    {'version': '1.1.0', 'date': '2026-07-01', 'changes': [
+        'Add watch list monitor (/watchlist route + --watchlist CLI): flag symbols down >loss-pct% vs 1wk/1mo/YTD close',
+        'Add /chart route: multi-symbol Chart.js line chart with configurable time span',
+        'Add version/changelog reporting via --version CLI flag and /version route',
+    ]},
+]
 
 # ============================================================================
 # CONFIGURATION
@@ -1938,15 +1957,36 @@ def get_live_quote(symbol):
                 logger.debug(f"Cache hit for {symbol}")
                 return price
         
+        # Money market funds have no live quote worth fetching - yfinance just
+        # reports the flat $1 NAV, not the yield-compounded synthetic price.
+        # Go straight to the synthetic price series.
+        if get_symbol_type(symbol) == 'MONEY_MARKET':
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT close FROM daily_quotes
+                WHERE symbol = ? AND data_source = 'synthetic_mmf'
+                ORDER BY quote_date DESC
+                LIMIT 1
+            ''', (symbol,))
+            result = cursor.fetchone()
+            conn.close()
+
+            if result and result['close']:
+                live_quote_cache[symbol] = (result['close'], now)
+                return result['close']
+
+            return None
+
         # Fetch live quote if market open
         if is_market_open():
             logger.info(f"Fetching live quote for {symbol}")
             price = fetch_live_quote_yfinance(symbol)
-            
+
             if price:
                 live_quote_cache[symbol] = (price, now)
                 return price
-        
+
         # Fallback: get last close from database
         logger.info(f"Market closed or fetch failed, returning last close for {symbol}")
         conn = get_db_connection()
@@ -1959,10 +1999,10 @@ def get_live_quote(symbol):
         ''', (symbol,))
         result = cursor.fetchone()
         conn.close()
-        
+
         if result and result['close']:
             return result['close']
-        
+
         return None
 
 # ============================================================================
@@ -2047,6 +2087,27 @@ def list_market_closures():
         print(f"{row['day']:<12} {row['date']:<15} {row['reason']}")
 
     print(f"{'='*80}\n")
+
+
+def _print_watchlist_report(alerts, loss_pct, gain_pct=None):
+    """Print a readable report of only the symbols/periods that breached loss_pct
+    (and gain_pct, if given)."""
+    header = f"Watch List Alert Report (loss >={loss_pct}%"
+    header += f", gain >={gain_pct}%" if gain_pct is not None else ""
+    header += ")"
+    print(f"\n{'='*90}")
+    print(header)
+    print(f"{'='*90}")
+    if not alerts:
+        print("No symbols breached the threshold(s).")
+        print(f"{'='*90}\n")
+        return
+    print(f"{'Symbol':<10} {'Period':<8} {'Dir':<6} {'Baseline Date':<15} {'Baseline':>10} {'Current':>10} {'% Change':>9}")
+    print(f"{'-'*90}")
+    for a in alerts:
+        print(f"{a['symbol']:<10} {a['period']:<8} {a['direction']:<6} {a['baseline_date']:<15} "
+              f"{fmt_price(a['baseline_close']):>10} {fmt_price(a['current_close']):>10} {a['percent_change']:>8.2f}%")
+    print(f"{'='*90}\n")
 
 
 def import_closures_from_file(filename):
@@ -2152,6 +2213,84 @@ def _close_value_on_date(symbol, date):
     conn.close()
     return row['close'] if row and row['close'] is not None else None
 
+def _compute_watchlist_alerts(symbols, loss_pct=12.0, gain_pct=None):
+    """For each symbol, compare latest close against close ~1wk ago, ~1mo ago, and
+    YTD (Jan 1 of current year), using _close_value_on_date's nearest-prior-date
+    logic (handles weekends/holidays automatically). Returns a list of alert dicts
+    for any period where the move from the baseline meets/exceeds loss_pct (a drop)
+    or, if gain_pct is given, gain_pct (a rise). Symbols or periods with no data
+    are silently skipped, not an error. Each alert has a 'direction' of 'loss' or
+    'gain' and a signed 'percent_change' (negative = drop, positive = rise)."""
+    today = datetime.now().date()
+    periods = [
+        ('1wk', today - timedelta(days=7)),
+        ('1mo', today - timedelta(days=30)),
+        ('ytd', datetime(today.year, 1, 1).date()),
+    ]
+    alerts = []
+    for symbol in symbols:
+        sym = symbol.strip().upper()
+        if not sym:
+            continue
+        current = _latest_close_value(sym)
+        if current is None:
+            continue
+        for period_label, period_date in periods:
+            date_str = period_date.strftime('%Y-%m-%d')
+            baseline = _close_value_on_date(sym, date_str)
+            if not baseline:
+                continue
+            pct_change = (current - baseline) / baseline * 100.0
+            direction = None
+            if pct_change <= -loss_pct:
+                direction = 'loss'
+            elif gain_pct is not None and pct_change >= gain_pct:
+                direction = 'gain'
+            if direction:
+                alerts.append({
+                    'symbol': sym,
+                    'period': period_label,
+                    'direction': direction,
+                    'baseline_date': date_str,
+                    'baseline_close': round(baseline, 4),
+                    'current_close': round(current, 4),
+                    'percent_change': round(pct_change, 4),
+                })
+    return alerts
+
+def get_closes_in_range(symbol, start_date, end_date):
+    """Return [(quote_date, close), ...] for a symbol within [start_date, end_date]
+    (inclusive), ordered by date ascending. Dates are 'YYYY-MM-DD' strings.
+    No auto-fetch; returns [] if the symbol has no rows in range."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT quote_date, close FROM daily_quotes
+        WHERE symbol = ? AND quote_date BETWEEN ? AND ? AND close IS NOT NULL
+        ORDER BY quote_date ASC
+    ''', (symbol.upper(), start_date, end_date))
+    rows = cursor.fetchall()
+    conn.close()
+    return [(row['quote_date'], row['close']) for row in rows]
+
+_CHART_SPANS = {
+    '1mo': lambda today: today - timedelta(days=30),
+    '3mo': lambda today: today - timedelta(days=90),
+    '6mo': lambda today: today - timedelta(days=182),
+    '1yr': lambda today: today - timedelta(days=365),
+    '5yr': lambda today: today - timedelta(days=365 * 5),
+    'ytd': lambda today: datetime(today.year, 1, 1).date(),
+}
+
+def _resolve_chart_span(span):
+    """Return (start_date, end_date) as 'YYYY-MM-DD' strings for a span keyword,
+    or None if span is not recognized."""
+    today = datetime.now().date()
+    if span not in _CHART_SPANS:
+        return None
+    start = _CHART_SPANS[span](today)
+    return start.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')
+
 @app.route('/funds')
 def list_funds_endpoint():
     """List money market (synthetic) funds as JSON."""
@@ -2220,6 +2359,129 @@ def export_quotes_to_html(symbol=None):
     except Exception as e:
         logger.error(f"Error generating HTML: {e}")
         return None
+
+
+@app.route('/watchlist')
+def watchlist_endpoint():
+    """Compare each symbol's latest close vs 1wk/1mo/YTD baselines and return
+    alerts where the move meets/exceeds loss_pct (a drop, default 12.0) or,
+    if gain_pct is given, gain_pct (a rise). Query params:
+      symbols   - optional comma-separated list (default: all tracked symbols)
+      loss_pct  - optional float threshold in percent (default 12.0)
+      gain_pct  - optional float threshold in percent; omitted = no upside check
+    Returns JSON: {"loss_pct": <float>, "gain_pct": <float|null>, "alerts": [
+    {symbol, period, direction, baseline_date, baseline_close, current_close,
+    percent_change}, ... ]}"""
+    try:
+        symbols_param = request.args.get('symbols')
+        if symbols_param:
+            symbols = [s.strip().upper() for s in symbols_param.split(',') if s.strip()]
+        else:
+            symbols = get_tracked_symbols()
+
+        loss_pct_param = request.args.get('loss_pct')
+        gain_pct_param = request.args.get('gain_pct')
+        try:
+            loss_pct = float(loss_pct_param) if loss_pct_param is not None else 12.0
+            gain_pct = float(gain_pct_param) if gain_pct_param is not None else None
+        except ValueError:
+            return jsonify({'error': f"Invalid loss_pct/gain_pct value: {loss_pct_param!r}/{gain_pct_param!r}"}), 400
+
+        alerts = _compute_watchlist_alerts(symbols, loss_pct, gain_pct)
+        return jsonify({'loss_pct': loss_pct, 'gain_pct': gain_pct, 'alerts': alerts})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _build_chart_html(series, span, start_date, end_date):
+    """Build a standalone HTML page with a Chart.js multi-line chart, one line per
+    symbol in `series` ({symbol: [(date, close), ...]}). Symbols with no rows in
+    range are still listed (empty dataset) so the caller can see they had no data,
+    rather than being silently dropped."""
+    all_dates = sorted({d for rows in series.values() for d, _ in rows})
+
+    datasets_js = []
+    palette = ['#4CAF50', '#2196F3', '#FF9800', '#9C27B0', '#F44336', '#00BCD4', '#795548', '#607D8B']
+    for i, (sym, rows) in enumerate(series.items()):
+        close_by_date = {d: c for d, c in rows}
+        data_points = [close_by_date.get(d) for d in all_dates]
+        color = palette[i % len(palette)]
+        js_data = [None if v is None else round(v, 4) for v in data_points]
+        datasets_js.append(
+            "{ label: '%s', data: %s, borderColor: '%s', backgroundColor: '%s', fill: false, spanGaps: true }"
+            % (sym, js_data, color, color)
+        )
+
+    no_data_symbols = [sym for sym, rows in series.items() if not rows]
+
+    html_parts = []
+    html_parts.append('<!DOCTYPE html>\n<html>\n<head>\n')
+    html_parts.append('<title>Stock Chart</title>\n')
+    html_parts.append('<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>\n')
+    html_parts.append('<script>\n')
+    html_parts.append('Chart.defaults.plugins.tooltip.backgroundColor = "#333";\n')
+    html_parts.append('Chart.defaults.plugins.tooltip.titleColor = "#fff";\n')
+    html_parts.append('Chart.defaults.plugins.tooltip.bodyColor = "#fff";\n')
+    html_parts.append('Chart.defaults.plugins.tooltip.borderWidth = 1;\n')
+    html_parts.append('Chart.defaults.plugins.tooltip.padding = 10;\n')
+    html_parts.append('Chart.defaults.plugins.tooltip.callbacks.labelColor = function(ctx) {\n')
+    html_parts.append('  const c = ctx.dataset.borderColor;\n')
+    html_parts.append('  return { borderColor: c, backgroundColor: c };\n')
+    html_parts.append('};\n')
+    html_parts.append('</script>\n')
+    html_parts.append('<style>\n')
+    html_parts.append('body { font-family: Arial, sans-serif; margin: 20px; }\n')
+    html_parts.append('#chartContainer { max-width: 1100px; margin: auto; }\n')
+    html_parts.append('</style>\n</head>\n<body>\n')
+    html_parts.append(f'<h1>Stock Chart ({span}: {start_date} to {end_date})</h1>\n')
+    if no_data_symbols:
+        html_parts.append(f'<p><b>No data in range for:</b> {", ".join(no_data_symbols)}</p>\n')
+    html_parts.append('<div id="chartContainer"><canvas id="stockChart"></canvas></div>\n')
+    html_parts.append('<script>\n')
+    html_parts.append(f'const labels = {all_dates};\n')
+    html_parts.append('const datasets = [%s];\n' % ', '.join(datasets_js))
+    html_parts.append('new Chart(document.getElementById("stockChart"), {\n')
+    html_parts.append('  type: "line",\n')
+    html_parts.append('  data: { labels: labels, datasets: datasets },\n')
+    html_parts.append('  options: {\n')
+    html_parts.append('    responsive: true,\n')
+    html_parts.append('    interaction: { mode: "index", intersect: false },\n')
+    html_parts.append('    scales: { x: { ticks: { maxTicksLimit: 12 } }, y: { title: { display: true, text: "Close" } } }\n')
+    html_parts.append('  }\n')
+    html_parts.append('});\n')
+    html_parts.append('</script>\n')
+    html_parts.append('</body>\n</html>')
+    return ''.join(html_parts)
+
+
+@app.route('/chart')
+@app.route('/chart/<symbols>')
+def chart_endpoint(symbols=None):
+    """Multi-symbol line chart (Chart.js, client-side rendering) over a configurable
+    span. URL form: /chart/AAPL,MSFT,VOO?span=1yr ; query-only form: /chart?symbols=...&span=...
+    span: one of 1mo, 3mo, 6mo, 1yr, ytd, 5yr (default: 6mo).
+    symbols: comma-separated list (default: all tracked symbols)."""
+    try:
+        symbols_param = symbols or request.args.get('symbols')
+        if symbols_param:
+            sym_list = [s.strip().upper() for s in symbols_param.split(',') if s.strip()]
+        else:
+            sym_list = get_tracked_symbols()
+
+        span = request.args.get('span', '6mo')
+        date_range = _resolve_chart_span(span)
+        if date_range is None:
+            return jsonify({'error': f"Invalid span '{span}'. Valid: {', '.join(_CHART_SPANS.keys())}"}), 400
+        start_date, end_date = date_range
+
+        if not sym_list:
+            return jsonify({'error': 'No symbols specified and no tracked symbols found'}), 400
+
+        series = {sym: get_closes_in_range(sym, start_date, end_date) for sym in sym_list}
+
+        return _build_chart_html(series, span, start_date, end_date)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/shutdown', methods=['POST', 'GET'])
@@ -2398,7 +2660,7 @@ def show_cache(fmt='html'):
 @app.route('/')
 def home():
     """Show API documentation"""
-    return f"<h1>Stock Quote Server (pid={os.getpid()})</h1>"+"""
+    return f"<h1>Stock Quote Server v{__version__} (pid={os.getpid()})</h1>"+"""
     <h2>API Endpoints:</h2>
     <ul>
         <li><code>/quote/&lt;symbol&gt;[,&lt;symbol&gt;...]</code> - Latest close (synthetic price for MMFs). Comma list -> CSV, missing -> #N/A</li>
@@ -2415,8 +2677,11 @@ def home():
         <li><a href="/closures"><code>/closures</code></a> - List all detected market closure dates</li>
         <li><a href="/config"><code>/config</code></a> - View configuration (read-only)</li>
         <li><a href="/health"><code>/health</code></a> - Server health check</li>
+        <li><a href="/version"><code>/version</code></a> - Version and changelog</li>
         <li><a href="/stats"><code>/stats</code></a> - Database statistics (HTML)</li>
         <li><a href="/cache/html"><code>/cache/html</code></a> - Live quote cache contents</li>
+        <li><code>/watchlist?symbols=&lt;csv&gt;&amp;loss_pct=&lt;float&gt;&amp;gain_pct=&lt;float&gt;</code> - Alert on symbols down &gt;loss_pct% (default 12%) or, if gain_pct given, up &gt;gain_pct%, vs 1wk/1mo/YTD (default: all tracked)</li>
+        <li><code>/chart/&lt;symbol&gt;[,&lt;symbol&gt;...]?span=&lt;span&gt;</code> - Multi-symbol line chart (Chart.js HTML). span: 1mo,3mo,6mo,1yr,ytd,5yr (default 6mo)</li>
         <li><code>/shutdown</code> - Stop the server</li>
     </ul>
     <h2>Examples:</h2>
@@ -2432,6 +2697,8 @@ def home():
         <li><a href="/quote/AAPL,MSFT,VOO/field/divyield">/quote/AAPL,MSFT,VOO/field/divyield</a> (batch CSV)</li>
         <li><a href="/export/QQQ">/export/QQQ</a> <B>Warning: Large amount of data</B> </li>
         <li><a href="/latest_date/AAPL">/latest_date/AAPL</a></li>
+        <li><a href="/watchlist">/watchlist</a> (all tracked symbols, default 12% threshold)</li>
+        <li><a href="/chart/AAPL,MSFT,VOO?span=1yr">/chart/AAPL,MSFT,VOO?span=1yr</a></li>
     </ul>
     <h2>Money Market Fund CLI:</h2>
     <ul>
@@ -2440,6 +2707,8 @@ def home():
         <li><code>python stock_system.py --rebuild-fund [SYMBOL]</code> - Rebuild synthetic prices from stored metrics and verify</li>
         <li><code>python stock_system.py --verify-fund [SYMBOL]</code> - Verify synthetic price accuracy</li>
         <li><code>python stock_system.py --reclassify</code> - Reclassify all tracked symbols via yfinance</li>
+        <li><code>python stock_system.py --watchlist [SYMBOLS] --loss-pct 12 --gain-pct 10</code> - Report symbols down &gt;loss-pct% or up &gt;gain-pct% vs 1wk/1mo/YTD</li>
+        <li><code>python stock_system.py --version</code> - Show version and latest changelog entry</li>
     </ul>
     """
 
@@ -2472,6 +2741,11 @@ def health():
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/version')
+def version_endpoint():
+    """Version and full changelog as JSON."""
+    return jsonify({'version': __version__, 'changelog': CHANGELOG})
 
 @app.route('/config')
 def view_config():
@@ -2791,66 +3065,73 @@ def is_process_running(pid):
         except (OSError, ProcessLookupError):
             return False
 
-def acquire_server_lock():
+def acquire_server_lock(secondary=False):
     """
-    Acquire exclusive server lock to prevent multiple instances
-    Returns True if lock acquired, False if another instance is running
+    Acquire exclusive server lock to prevent multiple instances of the same kind
+    (primary or secondary each get their own lock file, so one of each can run
+    at once). Returns True if lock acquired, False if another instance of the
+    same kind is running.
     """
+    lock_file = LOCK_FILE_SECONDARY if secondary else LOCK_FILE
+    stop_flag = ' --secondary' if secondary else ''
     try:
         # Check if lock file exists
-        if os.path.exists(LOCK_FILE):
+        if os.path.exists(lock_file):
             # Try to read PID from lock file
-            with open(LOCK_FILE, 'r') as f:
+            with open(lock_file, 'r') as f:
                 pid = int(f.read().strip())
-            
+
             # Check if process is still running (Windows-compatible)
             if is_process_running(pid):
                 # Process exists
                 logger.warning(f"Server already running (PID: {pid})")
                 print(f"Error: Server is already running (PID: {pid})")
-                print(f"Use 'python stock_system.py --stopserver' to stop it")
+                print(f"Use 'python stock_system.py --stopserver{stop_flag}' to stop it")
                 return False
             else:
                 # Process doesn't exist, stale lock file
                 logger.info("Removing stale lock file")
-                os.remove(LOCK_FILE)
-        
+                os.remove(lock_file)
+
         # Write current PID to lock file
-        with open(LOCK_FILE, 'w') as f:
+        with open(lock_file, 'w') as f:
             f.write(str(os.getpid()))
-        
+
         # Register cleanup on exit
-        atexit.register(release_server_lock)
-        
-        logger.info(f"Server lock acquired (PID: {os.getpid()})")
+        atexit.register(release_server_lock, secondary)
+
+        logger.info(f"Server lock acquired (PID: {os.getpid()}, secondary={secondary})")
         return True
-    
+
     except Exception as e:
         logger.error(f"Error acquiring server lock: {e}")
         return False
 
-def release_server_lock():
+def release_server_lock(secondary=False):
     """Release server lock on exit"""
+    lock_file = LOCK_FILE_SECONDARY if secondary else LOCK_FILE
     try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
             logger.info("Server lock released")
     except Exception as e:
         logger.error(f"Error releasing lock: {e}")
 
-def save_server_port(port):
+def save_server_port(port, secondary=False):
     """Save server port for stop command"""
+    port_file = SERVER_PORT_FILE_SECONDARY if secondary else SERVER_PORT_FILE
     try:
-        with open(SERVER_PORT_FILE, 'w') as f:
+        with open(port_file, 'w') as f:
             f.write(f"{port}\n{os.getpid()}")
     except Exception as e:
         logger.error(f"Error saving server port: {e}")
 
-def get_server_info():
+def get_server_info(secondary=False):
     """Get running server port and PID"""
+    port_file = SERVER_PORT_FILE_SECONDARY if secondary else SERVER_PORT_FILE
     try:
-        if os.path.exists(SERVER_PORT_FILE):
-            with open(SERVER_PORT_FILE, 'r') as f:
+        if os.path.exists(port_file):
+            with open(port_file, 'r') as f:
                 lines = f.read().strip().split('\n')
                 if len(lines) >= 2:
                     return int(lines[0]), int(lines[1])
@@ -2859,26 +3140,28 @@ def get_server_info():
         logger.error(f"Error reading server info: {e}")
         return None, None
 
-def stop_server():
+def stop_server(secondary=False):
     """Stop running server instance (cross-platform)"""
     import platform
     import subprocess
-    
-    port, pid = get_server_info()
-    
+
+    lock_file = LOCK_FILE_SECONDARY if secondary else LOCK_FILE
+    port_file = SERVER_PORT_FILE_SECONDARY if secondary else SERVER_PORT_FILE
+    port, pid = get_server_info(secondary)
+
     if not pid:
-        print("No server is currently running")
+        print(f"No {'secondary' if secondary else 'primary'} server is currently running")
         logger.info("Stop requested but no server running")
         return
-    
+
     # Check if process exists
     if not is_process_running(pid):
         print("Server process not found (stale PID file)")
         # Clean up stale files
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-        if os.path.exists(SERVER_PORT_FILE):
-            os.remove(SERVER_PORT_FILE)
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+        if os.path.exists(port_file):
+            os.remove(port_file)
         return
     
     print(f"Stopping server (PID: {pid})...")
@@ -2913,11 +3196,11 @@ def stop_server():
             time.sleep(1)
         
         # Clean up lock files
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-        if os.path.exists(SERVER_PORT_FILE):
-            os.remove(SERVER_PORT_FILE)
-        
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+        if os.path.exists(port_file):
+            os.remove(port_file)
+
         print("Server stopped")
         logger.info("Server stopped successfully")
     
@@ -3020,7 +3303,13 @@ def main():
     # Server
     parser.add_argument('--shutdown', '--stop', '--stopserver', action='store_true', help='Stop running server instance')
     parser.add_argument('--server', '--start', '--startserver', action='store_true', help='Run web server')
-    
+    parser.add_argument('--port', type=int, metavar='PORT',
+                        help='Port to bind for --server (default: 5000, or 5050 with --secondary)')
+    parser.add_argument('--secondary', action='store_true',
+                        help='Run/stop a second, independent instance (its own lock/port files, '
+                             'default port 5050, no auto-update scheduler) so it can run alongside '
+                             'the primary on port 5000. Use with --server or --shutdown.')
+
     # Symbol management
     parser.add_argument('--init', action='store_true', help='Initialize database')
     parser.add_argument('--add', action='append', help='Add symbol(s) - can use multiple times')
@@ -3059,7 +3348,18 @@ def main():
     parser.add_argument('--closures', action='store_true', help='List all market closure dates')
     parser.add_argument('--import-closures', nargs='?', const='__BUILTIN__', metavar='FILE',
                         help='Import market closures from CSV file (DATE[,REASON] per line, # for comments). Without FILE: seed from built-in MARKET_CLOSURES list.')
-    
+    parser.add_argument('--version', action='store_true', help='Show version and latest changelog entry')
+
+    # Watch list
+    parser.add_argument('--watchlist', nargs='?', const='__ALL__', metavar='SYMBOLS',
+                        help='Check watch list for drops (and gains, with --gain-pct) vs 1wk/1mo/YTD '
+                             'baselines. No value = all tracked symbols; one symbol or comma-separated '
+                             'list (e.g. --watchlist AAPL,MSFT). Use with --loss-pct/--gain-pct.')
+    parser.add_argument('--loss-pct', type=float, default=12.0,
+                        help='Loss percent threshold for --watchlist (default: 12.0)')
+    parser.add_argument('--gain-pct', type=float, default=None,
+                        help='Gain percent threshold for --watchlist (default: none, upside not checked)')
+
     args = parser.parse_args()
     
     # Set database path if provided
@@ -3068,7 +3368,15 @@ def main():
     
     # Handle --stopserver FIRST (before other commands)
     if args.shutdown:
-        stop_server()
+        stop_server(args.secondary)
+        return
+
+    if args.version:
+        print(f"stock_system.py version {__version__}")
+        latest = CHANGELOG[0]
+        print(f"\nLatest changes ({latest['version']}, {latest['date']}):")
+        for change in latest['changes']:
+            print(f"  - {change}")
         return
 
     # Handle commands
@@ -3136,6 +3444,15 @@ def main():
             verify_all_funds()
         else:
             _print_verify_report(verify_synthetic_prices(args.verify_fund))
+        return
+
+    if args.watchlist:
+        if args.watchlist == '__ALL__':
+            syms = get_tracked_symbols()
+        else:
+            syms = [s.strip().upper() for s in args.watchlist.split(',') if s.strip()]
+        alerts = _compute_watchlist_alerts(syms, args.loss_pct, args.gain_pct)
+        _print_watchlist_report(alerts, args.loss_pct, args.gain_pct)
         return
 
     if args.export:
@@ -3209,38 +3526,50 @@ def main():
             print(f"Error: Database not found at {DB_PATH}")
             print("Run with --init to create database")
             return
-        
-        # Acquire server lock (prevent multiple instances)
-        if not acquire_server_lock():
+
+        secondary = args.secondary
+        port = args.port or (5050 if secondary else 5000)
+        stop_flag = ' --secondary' if secondary else ''
+
+        # Acquire server lock (prevent multiple instances of the same kind)
+        if not acquire_server_lock(secondary):
             return
 
         # Save server info for stop command
-        save_server_port(5000)
-        
-        # Start scheduler
-        scheduler = start_scheduler()
-        
+        save_server_port(port, secondary)
+
+        # Secondary instances skip the auto-update scheduler: if it shares the
+        # primary's database, running the same cron job twice would duplicate
+        # writes and API calls against the same rows at the same time.
+        if secondary:
+            scheduler = None
+            print("Secondary instance: auto-update scheduler disabled (avoids duplicate "
+                  "scheduled writes if this shares the primary's database).")
+        else:
+            scheduler = start_scheduler()
+
         # Start server
         print("=" * 70)
-        print("Stock Quote Server Starting")
+        print(f"Stock Quote Server Starting{' (secondary)' if secondary else ''}")
         print("=" * 70)
         print(f"Database: {DB_PATH}")
-        print(f"Server: http://localhost:5000")
+        print(f"Server: http://localhost:{port}")
         print(f"PID: {os.getpid()}")
         print()
-        print("Test: http://localhost:5000/quote/AAPL")
-        print('Use in Calc: =WEBSERVICE("http://localhost:5000/quote/AAPL")')
+        print(f"Test: http://localhost:{port}/quote/AAPL")
+        print(f'Use in Calc: =WEBSERVICE("http://localhost:{port}/quote/AAPL")')
         print()
-        print("To stop: 'python stock_system.py --stopserver' or 'stop_server.bat'")
+        print(f"To stop: 'python stock_system.py --stopserver{stop_flag}' or 'stop_server.bat'")
         print("Or press Ctrl+C")
         print("=" * 70)
-        
+
         try:
-            app.run(host='127.0.0.1', port=5000, debug=False)
+            app.run(host='127.0.0.1', port=port, debug=False)
         except KeyboardInterrupt:
             print("\nShutting down...")
-            scheduler.shutdown()
-        
+            if scheduler:
+                scheduler.shutdown()
+
         return
     
     # No arguments - show help
