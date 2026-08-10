@@ -72,6 +72,7 @@ import threading
 import socket
 import atexit
 import csv
+import json
 from zoneinfo import ZoneInfo
 
 # Get Lock File with PID (if it exists)
@@ -87,9 +88,21 @@ SERVER_PORT_FILE_SECONDARY = os.path.join(os.environ.get('USERPROFILE', os.path.
 # VERSION
 # ============================================================================
 
-__version__ = '1.1.0'
+__version__ = '1.2.0'
 
 CHANGELOG = [
+    {'version': '1.2.0', 'date': '2026-08-10', 'changes': [
+        'Fix /chart rendering nothing when a money-market fund is charted with an equity '
+        '(date-gap points now serialize as JS null, not Python None)',
+        'Chart shows percent change by default for multiple symbols (comparable across price '
+        'levels); &prices charts raw prices, &comparePct forces percent for a single symbol',
+        'Money-market synthetic prices track each fund accurately: FRED fed-funds history is '
+        're-leveled to the fund\'s own yfinance yield (per-fund spread; real yield accrued daily '
+        'going forward), with FMP real-distribution reinvestment used when available and a '
+        'FRED-minus-expense proxy (--expense-ratio override) as the final fallback',
+        'Fix FMP integration: legacy /api/v3 endpoints were retired 2025-08-31; use the /stable '
+        'historical-price and dividends endpoints',
+    ]},
     {'version': '1.1.0', 'date': '2026-07-01', 'changes': [
         'Fix /quote/<symbol>/now returning "1" for money-market funds (now returns the synthetic price)',
         'Add watch list monitor (/watchlist route + --watchlist CLI): flag symbols down >loss-pct% (default 12%) '
@@ -279,6 +292,26 @@ def setup_database():
         ON fund_metrics(symbol, metric_date DESC)
     ''')
 
+    # Fund distributions table (real per-share dividends/distributions from FMP;
+    # used to build a reinvested total-return series for money market funds)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fund_distributions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol         TEXT NOT NULL,
+            ex_date        TEXT NOT NULL,
+            amount         REAL,
+            yield_reported REAL,
+            frequency      TEXT,
+            data_source    TEXT,
+            last_updated   TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, ex_date)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_fund_distributions_symbol_date
+        ON fund_distributions(symbol, ex_date DESC)
+    ''')
+
     # Symbol fundamentals table (P/E, dividend yield, expense ratio snapshots)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS symbol_fundamentals (
@@ -333,6 +366,24 @@ def migrate_schema():
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_fund_metrics_symbol_date
         ON fund_metrics(symbol, metric_date DESC)
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fund_distributions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol         TEXT NOT NULL,
+            ex_date        TEXT NOT NULL,
+            amount         REAL,
+            yield_reported REAL,
+            frequency      TEXT,
+            data_source    TEXT,
+            last_updated   TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, ex_date)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_fund_distributions_symbol_date
+        ON fund_distributions(symbol, ex_date DESC)
     ''')
 
     cursor.execute('''
@@ -1105,41 +1156,40 @@ def fetch_alphavantage(symbol, start_date, end_date, api_key):
 # ////////////////////
 
 def fetch_fmp(symbol, start_date, end_date, api_key):
-    """Fetch data from Financial Modeling Prep"""
+    """Fetch data from Financial Modeling Prep (stable EOD endpoint).
+
+    The legacy /api/v3/historical-price-full endpoint was retired 2025-08-31 and
+    now returns 403; this uses the current /stable/historical-price-eod/full
+    endpoint, which returns a flat list of {symbol,date,open,high,low,close,volume}."""
     try:
         import requests
-        from datetime import datetime
-        
+
         # FMP uses date strings directly (YYYY-MM-DD format)
-        # Historical price endpoint
-        url = f'https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}'
+        url = 'https://financialmodelingprep.com/stable/historical-price-eod/full'
         params = {
+            'symbol': symbol,
             'from': start_date,
             'to': end_date,
             'apikey': api_key
         }
-        
+
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
-        
+
         data = response.json()
-        
-        # Check for errors
-        if 'Error Message' in data:
+
+        # Errors come back as a dict with an 'Error Message' key
+        if isinstance(data, dict) and 'Error Message' in data:
             logger.error(f"FMP: {data['Error Message']} for {symbol}")
             return None
-        
-        # FMP returns data in a nested structure
-        if 'historical' not in data:
+
+        # Stable endpoint returns a flat list of daily records
+        historical = data if isinstance(data, list) else []
+
+        if not historical:
             logger.warning(f"FMP: no historical data available for {symbol}")
             return None
-        
-        historical = data['historical']
-        
-        if not historical:
-            logger.warning(f"FMP: empty data for {symbol}")
-            return None
-        
+
         # Convert to our quote format
         quotes = []
         for record in historical:
@@ -1440,22 +1490,32 @@ def get_missing_dates(symbol, start_date, end_date):
 # MONEY MARKET FUND DATA
 # ============================================================================
 
-def fetch_mmf_yield_fred(symbol, start_date, end_date=None):
+def fetch_mmf_yield_fred(symbol, start_date, end_date=None, expense_ratio=0.0):
     """
     Fetch the daily Federal Funds Rate from FRED as a yield proxy for money
     market funds. Uses FRED's public CSV endpoint — no API key required.
     Returns a list of fund_metrics dicts.
+
+    A fund's net 7-day yield runs below the fed funds rate by its expense ratio,
+    so `expense_ratio` (an annual fraction, e.g. 0.0011 = 0.11%) is subtracted
+    from the DFF rate and the net yield (floored at 0) is stored in yield_annual.
+    Passing 0.0 reproduces the old gross-of-fees behavior.
     """
     if end_date is None:
         end_date = datetime.now().strftime('%Y-%m-%d')
+    expense_ratio = float(expense_ratio or 0.0)
     try:
         import urllib.request as _urllib
         import csv as _csv
         import io as _io
 
+        # The fredgraph.csv endpoint uses cosd/coed for the date window (the
+        # observation_start/observation_end names are for the developer API and are
+        # silently ignored here, which would otherwise return the full DFF history
+        # back to 1954).
         url = (
             f"https://fred.stlouisfed.org/graph/fredgraph.csv"
-            f"?id=DFF&observation_start={start_date}&observation_end={end_date}"
+            f"?id=DFF&cosd={start_date}&coed={end_date}"
         )
         req = _urllib.Request(url, headers={'User-Agent': 'local_stock/1.0'})
         with _urllib.urlopen(req, timeout=30) as resp:
@@ -1469,22 +1529,284 @@ def fetch_mmf_yield_fred(symbol, start_date, end_date=None):
             if not date_str or not rate_str or rate_str == '.':
                 continue
             try:
+                gross = float(rate_str) / 100.0
+                net = max(0.0, gross - expense_ratio)
                 metrics.append({
                     'symbol': symbol.upper(),
                     'metric_date': date_str,
-                    'yield_annual': float(rate_str) / 100.0,
-                    'yield_source': 'fred_dff',
+                    'yield_annual': net,
+                    'yield_source': 'fred_dff_net' if expense_ratio else 'fred_dff',
                     'total_assets': None,
-                    'expense_ratio': None,
+                    'expense_ratio': expense_ratio or None,
                     'data_source': 'fred',
                 })
             except ValueError:
                 continue
-        logger.info(f"FRED: fetched {len(metrics)} yield records for {symbol}")
+        logger.info(f"FRED: fetched {len(metrics)} yield records for {symbol} "
+                    f"(expense_ratio={expense_ratio:.4%})")
         return metrics
     except Exception as e:
         logger.error(f"FRED fetch error for {symbol}: {e}")
         return []
+
+def fetch_mmf_yield_yfinance(symbol):
+    """Current net yield for a money market fund from yfinance (info['sevenDayYield']
+    or 'yield'), as an annual fraction (e.g. 0.0368 = 3.68%), or None.
+
+    This is the fund's own realized yield — already net of fees and reflecting the
+    fund's type (government/prime/muni) and repo spread — so it anchors the generic
+    FRED fed-funds proxy to the correct level per fund. Yahoo does not carry MM-fund
+    distribution history, but it does populate this yield field."""
+    try:
+        info = yf.Ticker(symbol).info
+        y = info.get('sevenDayYield')
+        if y is None:
+            y = info.get('yield')
+        if y is None:
+            return None
+        y = float(y)
+        if y > 1.0:  # some feeds report a percent (e.g. 3.68) rather than 0.0368
+            y = y / 100.0
+        return y if y >= 0 else None
+    except Exception as e:
+        logger.error(f"yfinance yield fetch failed for {symbol}: {e}")
+        return None
+
+def get_fund_expense_ratio(symbol):
+    """Latest stored expense ratio (annual fraction) for a fund from
+    symbol_fundamentals, or 0.0 if none is on record. Used to net FRED yields."""
+    er = _fundamental_value(symbol, 'expense_ratio')
+    return float(er) if er is not None else 0.0
+
+def _get_fmp_api_key():
+    """Return the stored FMP API key, or None."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT api_key FROM data_sources WHERE source_name = 'fmp'")
+    row = cursor.fetchone()
+    conn.close()
+    return (row['api_key'] if row else None) or None
+
+def fetch_fmp_dividends(symbol, api_key):
+    """Fetch real per-share distributions for a fund/stock from FMP's stable
+    /dividends endpoint. Returns a list of distribution dicts, or None when the
+    data is unavailable (no key, premium-gated 402, legacy 403, or empty).
+
+    Money market fund symbols require an FMP plan that includes mutual funds;
+    without it FMP returns HTTP 402 and this returns None so the caller can fall
+    back to the FRED proxy."""
+    if not api_key:
+        return None
+    try:
+        import requests
+        url = 'https://financialmodelingprep.com/stable/dividends'
+        resp = requests.get(url, params={'symbol': symbol, 'apikey': api_key}, timeout=15)
+        if resp.status_code in (401, 402, 403):
+            logger.info(f"FMP dividends unavailable for {symbol} (HTTP {resp.status_code}; "
+                        f"plan may not include this symbol)")
+            return None
+        resp.raise_for_status()
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.info(f"FMP dividends: non-JSON response for {symbol}")
+            return None
+        if isinstance(data, dict):  # error payloads come back as a dict
+            logger.info(f"FMP dividends: {data.get('Error Message', 'no data')} for {symbol}")
+            return None
+        records = []
+        for r in data:
+            ex_date = r.get('date')
+            if not ex_date:
+                continue
+            amount = r.get('adjDividend')
+            if amount is None:
+                amount = r.get('dividend')
+            records.append({
+                'symbol': symbol.upper(),
+                'ex_date': ex_date,
+                'amount': float(amount) if amount is not None else None,
+                'yield_reported': r.get('yield'),
+                'frequency': r.get('frequency'),
+                'data_source': 'fmp',
+            })
+        logger.info(f"FMP: fetched {len(records)} distributions for {symbol}")
+        return records or None
+    except Exception as e:
+        logger.error(f"FMP dividends fetch error for {symbol}: {e}")
+        return None
+
+def save_fund_distributions(records):
+    """Batch-save fund distribution records to fund_distributions."""
+    if not records:
+        return 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    n = 0
+    for r in records:
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO fund_distributions
+                (symbol, ex_date, amount, yield_reported, frequency, data_source, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (r['symbol'], r['ex_date'], r.get('amount'),
+                  r.get('yield_reported'), r.get('frequency'), r.get('data_source', 'fmp')))
+            n += 1
+        except Exception as e:
+            logger.error(f"Error saving distribution {r.get('symbol')} {r.get('ex_date')}: {e}")
+    conn.commit()
+    conn.close()
+    return n
+
+def delete_fund_metrics(symbol):
+    """Remove all fund_metrics rows for a symbol. Used before re-seeding from a
+    different yield source so sources are never mixed within one series."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM fund_metrics WHERE symbol = ?", (symbol.upper(),))
+    conn.commit()
+    conn.close()
+
+def get_fund_yield_source(symbol):
+    """yield_source of the most recent fund_metrics row for a symbol
+    (e.g. 'fmp_distribution', 'fred_dff_net', 'fred_dff'), or None."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT yield_source FROM fund_metrics WHERE symbol = ?
+                      ORDER BY metric_date DESC LIMIT 1''', (symbol.upper(),))
+    row = cursor.fetchone()
+    conn.close()
+    return row['yield_source'] if row else None
+
+def distributions_to_daily_metrics(symbol, pairs, end_date):
+    """Convert real distributions into daily fund_metrics rows whose gap-aware
+    compounding reproduces a reinvested total-return series.
+
+    pairs: ascending [(ex_date 'YYYY-MM-DD', amount_per_share), ...] with amount>0.
+    Money market NAV is held at $1.00, so a distribution of `d` per share reinvests
+    to a growth factor of (1 + d) over the period since the prior ex-date. That
+    growth is spread across the period's days as a constant implied annual yield
+    (yield_annual = 365 * ((1+d)**(1/gap_days) - 1)), so the stored series is a
+    smooth daily curve that hits the exact reinvested value on every ex-date.
+    Days after the last distribution are projected at the last period's run-rate
+    (self-corrects when the next real distribution arrives). The first ex-date is
+    the $1.00 anchor (its own pre-history is not modeled)."""
+    if len(pairs) < 2:
+        return []
+    rows = [(pairs[0][0], 0.0)]  # anchor at 1.00; first row gets no compounding
+    prev = datetime.strptime(pairs[0][0], '%Y-%m-%d').date()
+    last_ya = 0.0
+    for ex_str, amount in pairs[1:]:
+        ex = datetime.strptime(ex_str, '%Y-%m-%d').date()
+        gap = (ex - prev).days
+        if gap < 1:
+            continue
+        ya = 365.0 * ((1.0 + max(0.0, amount)) ** (1.0 / gap) - 1.0)
+        last_ya = ya
+        d = prev + timedelta(days=1)
+        while d <= ex:
+            rows.append((d.isoformat(), ya))
+            d += timedelta(days=1)
+        prev = ex
+    end = datetime.strptime(end_date, '%Y-%m-%d').date()
+    d = prev + timedelta(days=1)
+    while d <= end:  # project run-rate to end_date
+        rows.append((d.isoformat(), last_ya))
+        d += timedelta(days=1)
+    return [{'symbol': symbol.upper(), 'metric_date': dt, 'yield_annual': ya,
+             'yield_source': 'fmp_distribution', 'total_assets': None,
+             'expense_ratio': None, 'data_source': 'fmp'} for dt, ya in rows]
+
+def seed_fund_from_fmp(symbol, end_date=None):
+    """(Re)build a fund's yield metrics from real FMP distributions.
+    Returns the number of daily metric rows written, or 0 when FMP has no usable
+    distribution data for the symbol (caller then falls back to the FRED proxy).
+    Replaces any existing metrics for the symbol so yield sources never mix."""
+    symbol = symbol.upper()
+    if end_date is None:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+    dists = fetch_fmp_dividends(symbol, _get_fmp_api_key())
+    if not dists:
+        return 0
+    save_fund_distributions(dists)
+    pairs = sorted((d['ex_date'], d['amount']) for d in dists
+                   if d.get('amount') and d['amount'] > 0)
+    metrics = distributions_to_daily_metrics(symbol, pairs, end_date)
+    if not metrics:
+        return 0
+    delete_fund_metrics(symbol)
+    save_fund_metrics(metrics)
+    return len(metrics)
+
+def seed_fund_from_yield_anchor(symbol, years=3, end_date=None):
+    """Seed MM metrics from FRED DFF re-leveled to the fund's own current yield
+    (yfinance): net_yield[d] = max(0, DFF[d] + (fund_yield_now - DFF_now)). The
+    measured offset captures the fund's fees, type and repo spread in one number
+    while DFF supplies the historical rate shape. Returns row count, or 0 when the
+    fund yield is unavailable (caller falls back to the plain expense-netted proxy)."""
+    symbol = symbol.upper()
+    if end_date is None:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+    fund_yield = fetch_mmf_yield_yfinance(symbol)
+    if fund_yield is None:
+        return 0
+    start_date = (datetime.now() - timedelta(days=365 * years)).strftime('%Y-%m-%d')
+    dff = fetch_mmf_yield_fred(symbol, start_date, end_date)  # gross DFF (expense_ratio=0)
+    if not dff:
+        return 0
+    dff_now = max(dff, key=lambda r: r['metric_date'])['yield_annual']
+    spread = fund_yield - dff_now
+    metrics = []
+    for m in dff:
+        m2 = dict(m)
+        m2['yield_annual'] = max(0.0, (m['yield_annual'] or 0.0) + spread)
+        m2['yield_source'] = 'fred_dff_anchored'
+        metrics.append(m2)
+    delete_fund_metrics(symbol)
+    save_fund_metrics(metrics)
+    print(f"  Anchored to yfinance yield {fund_yield:.4%} "
+          f"(DFF now {dff_now:.4%}, spread {spread:+.4%})")
+    return len(metrics)
+
+def update_anchored_fund_today(symbol):
+    """Append rows accruing the fund's real current yfinance yield since the last
+    stored date (exact going forward). Returns rows written, or 0 if none/unavailable."""
+    symbol = symbol.upper()
+    today = datetime.now().strftime('%Y-%m-%d')
+    fund_yield = fetch_mmf_yield_yfinance(symbol)
+    if fund_yield is None:
+        return 0
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''SELECT quote_date, close FROM daily_quotes
+                      WHERE symbol = ? AND data_source = 'synthetic_mmf'
+                      ORDER BY quote_date DESC LIMIT 1''', (symbol,))
+    last = cursor.fetchone()
+    conn.close()
+    if not last:
+        return 0
+    last_date = last['quote_date']
+    last_price = last['close']
+    d0 = datetime.strptime(last_date, '%Y-%m-%d').date()
+    dend = datetime.strptime(today, '%Y-%m-%d').date()
+    if dend <= d0:
+        return 0
+    new_pairs = []
+    d = d0 + timedelta(days=1)
+    while d <= dend:
+        new_pairs.append((d.isoformat(), fund_yield))
+        d += timedelta(days=1)
+    metric_rows = [{'symbol': symbol, 'metric_date': dt, 'yield_annual': fund_yield,
+                    'yield_source': 'yfinance_yield', 'total_assets': None,
+                    'expense_ratio': None, 'data_source': 'yfinance'} for dt, _ in new_pairs]
+    save_fund_metrics(metric_rows)
+    # Anchor on the last stored price so the first new row compounds across the gap.
+    anchored = _synthetic_series_from_metrics(
+        [(last_date, None)] + new_pairs, start_price=last_price)[1:]
+    quotes = [{'symbol': symbol, 'quote_date': dt, 'open': p, 'high': p, 'low': p,
+               'close': p, 'volume': 0, 'dividends': fund_yield, 'stock_splits': 0.0,
+               'data_source': 'synthetic_mmf'} for dt, p in anchored]
+    return save_quotes(quotes)
 
 def save_fund_metrics(metrics_list):
     """Batch-save fund metric records to fund_metrics table."""
@@ -1714,9 +2036,23 @@ def verify_all_funds():
 def update_synthetic_price_today(symbol):
     """Append new synthetic price rows since the last stored date."""
     today = datetime.now().strftime('%Y-%m-%d')
+
+    src = get_fund_yield_source(symbol)
+    # FMP distribution-sourced funds: re-pull distributions and rebuild the
+    # reinvested series (cheap; folds in any new distribution and keeps the
+    # run-rate projection current). Falls through to FRED if FMP data is gone.
+    if src == 'fmp_distribution':
+        n = seed_fund_from_fmp(symbol, today)
+        if n:
+            return rebuild_synthetic_prices(symbol)
+    # yfinance-yield-anchored funds: accrue the fund's real current yield forward.
+    elif src in ('fred_dff_anchored', 'yfinance_yield'):
+        return update_anchored_fund_today(symbol)
+
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
-    recent = fetch_mmf_yield_fred(symbol, yesterday, today)
+    expense_ratio = get_fund_expense_ratio(symbol)
+    recent = fetch_mmf_yield_fred(symbol, yesterday, today, expense_ratio=expense_ratio)
     if recent:
         save_fund_metrics(recent)
 
@@ -1769,8 +2105,14 @@ def update_synthetic_price_today(symbol):
         })
     return save_quotes(new_quotes)
 
-def add_money_market_fund(symbol, years=3):
-    """Add a symbol, force-classify as MONEY_MARKET, and seed historical yield."""
+def add_money_market_fund(symbol, years=3, expense_ratio=None):
+    """Add a symbol, force-classify as MONEY_MARKET, and seed historical yield.
+
+    The stored yield is netted of the fund's expense ratio (see fetch_mmf_yield_fred).
+    `expense_ratio` (annual fraction) overrides the yfinance-reported value when given;
+    otherwise it is taken from fundamentals, defaulting to 0.0 if unavailable.
+    Re-running this on an existing fund re-fetches FRED and rebuilds, so it is also
+    the way to migrate an already-seeded gross series to net."""
     symbol = symbol.upper()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1784,11 +2126,42 @@ def add_money_market_fund(symbol, years=3):
     name_str = f" ({classification['name']})" if classification['name'] else ""
     print(f"Added {symbol} as MONEY_MARKET{name_str}")
 
+    # Persist fundamentals so the expense ratio is on record for future updates.
+    rec = fetch_fundamentals_yfinance(symbol)
+    if rec:
+        save_fundamentals([rec])
+    if expense_ratio is None:
+        expense_ratio = (rec.get('expense_ratio') if rec else None) or 0.0
+    expense_ratio = float(expense_ratio)
+    print(f"  Using expense ratio {expense_ratio:.4%} (net-of-fees yield)")
+
     today = datetime.now()
-    start_date = (today - timedelta(days=365 * years)).strftime('%Y-%m-%d')
     end_date = today.strftime('%Y-%m-%d')
+
+    # Prefer real distributions from FMP (exact reinvested total return); fall
+    # back to the FRED fed-funds proxy net of expenses when FMP has no fund data
+    # (e.g. the plan does not cover mutual funds -> HTTP 402).
+    n_fmp = seed_fund_from_fmp(symbol, end_date)
+    if n_fmp:
+        rebuilt = rebuild_synthetic_prices(symbol)
+        update_symbol_tracking(symbol)
+        print(f"  Built {rebuilt} synthetic price records from FMP distributions "
+              f"({n_fmp} daily metrics)")
+        return
+
+    # Next best (free): FRED DFF re-leveled to the fund's own yfinance yield.
+    n_anchor = seed_fund_from_yield_anchor(symbol, years, end_date)
+    if n_anchor:
+        rebuilt = rebuild_synthetic_prices(symbol)
+        update_symbol_tracking(symbol)
+        print(f"  Built {rebuilt} synthetic price records from FRED DFF anchored to fund yield")
+        return
+    print("  yfinance yield unavailable; using FRED fed-funds proxy net of expense")
+
+    start_date = (today - timedelta(days=365 * years)).strftime('%Y-%m-%d')
     print(f"  Fetching yield data from FRED ({start_date} to {end_date})...")
-    metrics = fetch_mmf_yield_fred(symbol, start_date, end_date)
+    delete_fund_metrics(symbol)  # clear any prior source so series stays homogeneous
+    metrics = fetch_mmf_yield_fred(symbol, start_date, end_date, expense_ratio=expense_ratio)
     if metrics:
         saved = save_fund_metrics(metrics)
         print(f"  Saved {saved} yield records")
@@ -2410,11 +2783,15 @@ def watchlist_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
-def _build_chart_html(series, span, start_date, end_date):
+def _build_chart_html(series, span, start_date, end_date, pct_mode=False):
     """Build a standalone HTML page with a Chart.js multi-line chart, one line per
     symbol in `series` ({symbol: [(date, close), ...]}). Symbols with no rows in
     range are still listed (empty dataset) so the caller can see they had no data,
-    rather than being silently dropped."""
+    rather than being silently dropped.
+
+    When pct_mode is True each series is rebased to percent change from its own
+    first in-range value, so series at very different price levels (e.g. a $1 money
+    market fund vs a $400 equity) are directly comparable on one axis."""
     all_dates = sorted({d for rows in series.values() for d, _ in rows})
 
     datasets_js = []
@@ -2422,11 +2799,22 @@ def _build_chart_html(series, span, start_date, end_date):
     for i, (sym, rows) in enumerate(series.items()):
         close_by_date = {d: c for d, c in rows}
         data_points = [close_by_date.get(d) for d in all_dates]
+        if pct_mode:
+            baseline = next((v for v in data_points if v is not None), None)
+            if baseline:  # non-None and non-zero
+                data_points = [None if v is None else (v / baseline - 1.0) * 100.0
+                               for v in data_points]
+            else:
+                data_points = [None for _ in data_points]
+            js_data = [None if v is None else round(v, 3) for v in data_points]
+        else:
+            js_data = [None if v is None else round(v, 4) for v in data_points]
         color = palette[i % len(palette)]
-        js_data = [None if v is None else round(v, 4) for v in data_points]
+        # json.dumps so gaps serialize as `null` (not Python `None`, which is
+        # invalid JS and silently kills the whole chart) and labels are quoted.
         datasets_js.append(
-            "{ label: '%s', data: %s, borderColor: '%s', backgroundColor: '%s', fill: false, spanGaps: true }"
-            % (sym, js_data, color, color)
+            "{ label: %s, data: %s, borderColor: '%s', backgroundColor: '%s', fill: false, spanGaps: true }"
+            % (json.dumps(sym), json.dumps(js_data), color, color)
         )
 
     no_data_symbols = [sym for sym, rows in series.items() if not rows]
@@ -2450,12 +2838,13 @@ def _build_chart_html(series, span, start_date, end_date):
     html_parts.append('body { font-family: Arial, sans-serif; margin: 20px; }\n')
     html_parts.append('#chartContainer { max-width: 1100px; margin: auto; }\n')
     html_parts.append('</style>\n</head>\n<body>\n')
-    html_parts.append(f'<h1>Stock Chart ({span}: {start_date} to {end_date})</h1>\n')
+    mode_label = '% change' if pct_mode else 'prices'
+    html_parts.append(f'<h1>Stock Chart ({span}: {start_date} to {end_date}) &mdash; {mode_label}</h1>\n')
     if no_data_symbols:
         html_parts.append(f'<p><b>No data in range for:</b> {", ".join(no_data_symbols)}</p>\n')
     html_parts.append('<div id="chartContainer"><canvas id="stockChart"></canvas></div>\n')
     html_parts.append('<script>\n')
-    html_parts.append(f'const labels = {all_dates};\n')
+    html_parts.append('const labels = %s;\n' % json.dumps(all_dates))
     html_parts.append('const datasets = [%s];\n' % ', '.join(datasets_js))
     html_parts.append('new Chart(document.getElementById("stockChart"), {\n')
     html_parts.append('  type: "line",\n')
@@ -2463,7 +2852,15 @@ def _build_chart_html(series, span, start_date, end_date):
     html_parts.append('  options: {\n')
     html_parts.append('    responsive: true,\n')
     html_parts.append('    interaction: { mode: "index", intersect: false },\n')
-    html_parts.append('    scales: { x: { ticks: { maxTicksLimit: 12 } }, y: { title: { display: true, text: "Close" } } }\n')
+    if pct_mode:
+        html_parts.append('    plugins: { tooltip: { callbacks: {\n')
+        html_parts.append('      label: function(ctx) { return ctx.dataset.label + ": " + (ctx.parsed.y == null ? "-" : ctx.parsed.y.toFixed(2) + "%"); }\n')
+        html_parts.append('    } } },\n')
+        html_parts.append('    scales: { x: { ticks: { maxTicksLimit: 12 } },\n')
+        html_parts.append('      y: { title: { display: true, text: "% change from start" },\n')
+        html_parts.append('           ticks: { callback: function(v) { return v + "%"; } } } }\n')
+    else:
+        html_parts.append('    scales: { x: { ticks: { maxTicksLimit: 12 } }, y: { title: { display: true, text: "Close" } } }\n')
     html_parts.append('  }\n')
     html_parts.append('});\n')
     html_parts.append('</script>\n')
@@ -2477,7 +2874,12 @@ def chart_endpoint(symbols=None):
     """Multi-symbol line chart (Chart.js, client-side rendering) over a configurable
     span. URL form: /chart/AAPL,MSFT,VOO?span=1yr ; query-only form: /chart?symbols=...&span=...
     span: one of 1mo, 3mo, 6mo, 1yr, ytd, 5yr (default: 6mo).
-    symbols: comma-separated list (default: all tracked symbols)."""
+    symbols: comma-separated list (default: all tracked symbols).
+
+    With more than one symbol the chart shows percent change from each series' first
+    in-range value by default, so items at very different price levels are comparable.
+    Append &prices to chart raw prices instead (synthetic price for a money market
+    fund). A single symbol defaults to prices; append &comparePct to force percent."""
     try:
         symbols_param = symbols or request.args.get('symbols')
         if symbols_param:
@@ -2494,9 +2896,23 @@ def chart_endpoint(symbols=None):
         if not sym_list:
             return jsonify({'error': 'No symbols specified and no tracked symbols found'}), 400
 
+        # Mode: percent-change is the default for multi-symbol comparisons; &prices
+        # forces raw prices; &comparePct/&pct forces percent (e.g. for one symbol).
+        prices_req = ('prices' in request.args) or \
+            str(request.args.get('prices', '')).lower() in ('1', 'true', 'yes', 'on')
+        pct_req = ('comparePct' in request.args) or \
+            str(request.args.get('pct', '')).lower() in ('1', 'true', 'yes', 'on') or \
+            request.args.get('compare', '').lower() == 'pct'
+        if prices_req:
+            pct_mode = False
+        elif pct_req:
+            pct_mode = True
+        else:
+            pct_mode = len(sym_list) > 1
+
         series = {sym: get_closes_in_range(sym, start_date, end_date) for sym in sym_list}
 
-        return _build_chart_html(series, span, start_date, end_date)
+        return _build_chart_html(series, span, start_date, end_date, pct_mode)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2698,7 +3114,7 @@ def home():
         <li><a href="/stats"><code>/stats</code></a> - Database statistics (HTML)</li>
         <li><a href="/cache/html"><code>/cache/html</code></a> - Live quote cache contents</li>
         <li><code>/watchlist?symbols=&lt;csv&gt;&amp;loss_pct=&lt;float&gt;&amp;gain_pct=&lt;float&gt;</code> - Alert on symbols down &gt;loss_pct% (default 12%) or, if gain_pct given, up &gt;gain_pct%, vs 1wk/1mo/YTD (default: all tracked)</li>
-        <li><code>/chart/&lt;symbol&gt;[,&lt;symbol&gt;...]?span=&lt;span&gt;</code> - Multi-symbol line chart (Chart.js HTML). span: 1mo,3mo,6mo,1yr,ytd,5yr (default 6mo)</li>
+        <li><code>/chart/&lt;symbol&gt;[,&lt;symbol&gt;...]?span=&lt;span&gt;</code> - Multi-symbol line chart (Chart.js HTML). span: 1mo,3mo,6mo,1yr,ytd,5yr (default 6mo). Multiple symbols show % change by default (compares across price levels, e.g. a MM fund vs an equity); append <code>&amp;prices</code> for raw prices, <code>&amp;comparePct</code> to force % for one symbol</li>
         <li><code>/shutdown</code> - Stop the server</li>
     </ul>
     <h2>Examples:</h2>
@@ -3351,6 +3767,9 @@ def main():
 
     # Money market fund management
     parser.add_argument('--add-fund', type=str, metavar='SYMBOL', help='Add a money market fund and seed full yield history from FRED')
+    parser.add_argument('--expense-ratio', type=float, metavar='FRACTION',
+                        help='Override the fund expense ratio for --add-fund (annual fraction, '
+                             'e.g. 0.0011 for 0.11%%); FRED yield is stored net of this')
     parser.add_argument('--reclassify', action='store_true', help='Reclassify all tracked symbols via yfinance (run once after migration)')
     parser.add_argument('--list-funds', action='store_true', help='List money market (synthetic) funds and their synthetic-row coverage')
     parser.add_argument('--rebuild-fund', nargs='?', const='__ALL__', metavar='SYMBOL', help='Rebuild synthetic prices from stored FRED metrics and verify (no SYMBOL = all funds)')
@@ -3441,7 +3860,8 @@ def main():
         return
 
     if args.add_fund:
-        add_money_market_fund(args.add_fund.upper(), years=args.years or 3)
+        add_money_market_fund(args.add_fund.upper(), years=args.years or 3,
+                              expense_ratio=args.expense_ratio)
         return
 
     if args.reclassify:
