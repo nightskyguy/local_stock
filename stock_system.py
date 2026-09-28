@@ -2520,10 +2520,13 @@ def list_market_closures():
 
 def _print_watchlist_report(alerts, loss_pct, gain_pct=None):
     """Print a readable report of only the symbols/periods that breached loss_pct
-    (and gain_pct, if given)."""
-    header = f"Watch List Alert Report (loss >={loss_pct}%"
-    header += f", gain >={gain_pct}%" if gain_pct is not None else ""
-    header += ")"
+    and/or gain_pct (either may be None to mean that side wasn't checked)."""
+    thresholds = []
+    if loss_pct is not None:
+        thresholds.append(f"loss >={loss_pct}%")
+    if gain_pct is not None:
+        thresholds.append(f"gain >={gain_pct}%")
+    header = f"Watch List Alert Report ({', '.join(thresholds) or 'no thresholds'})"
     print(f"\n{'='*90}")
     print(header)
     print(f"{'='*90}")
@@ -2646,10 +2649,11 @@ def _compute_watchlist_alerts(symbols, loss_pct=12.0, gain_pct=None):
     """For each symbol, compare latest close against close ~1wk ago, ~1mo ago, and
     YTD (Jan 1 of current year), using _close_value_on_date's nearest-prior-date
     logic (handles weekends/holidays automatically). Returns a list of alert dicts
-    for any period where the move from the baseline meets/exceeds loss_pct (a drop)
-    or, if gain_pct is given, gain_pct (a rise). Symbols or periods with no data
-    are silently skipped, not an error. Each alert has a 'direction' of 'loss' or
-    'gain' and a signed 'percent_change' (negative = drop, positive = rise)."""
+    for any period where the move from the baseline meets/exceeds loss_pct (a drop),
+    if loss_pct is given, or gain_pct (a rise), if gain_pct is given. Either
+    threshold may be None to skip that check entirely. Symbols or periods with no
+    data are silently skipped, not an error. Each alert has a 'direction' of 'loss'
+    or 'gain' and a signed 'percent_change' (negative = drop, positive = rise)."""
     today = datetime.now().date()
     periods = [
         ('1wk', today - timedelta(days=7)),
@@ -2671,7 +2675,7 @@ def _compute_watchlist_alerts(symbols, loss_pct=12.0, gain_pct=None):
                 continue
             pct_change = (current - baseline) / baseline * 100.0
             direction = None
-            if pct_change <= -loss_pct:
+            if loss_pct is not None and pct_change <= -loss_pct:
                 direction = 'loss'
             elif gain_pct is not None and pct_change >= gain_pct:
                 direction = 'gain'
@@ -2794,11 +2798,13 @@ def export_quotes_to_html(symbol=None):
 def watchlist_endpoint():
     """Compare each symbol's latest close vs 1wk/1mo/YTD baselines and return
     alerts where the move meets/exceeds loss_pct (a drop, default 12.0) or,
-    if gain_pct is given, gain_pct (a rise). Query params:
+    if gain_pct is given, gain_pct (a rise). Passing gain_pct alone (no loss_pct)
+    checks only the gain side. Query params:
       symbols   - optional comma-separated list (default: all tracked symbols)
-      loss_pct  - optional float threshold in percent (default 12.0)
+      loss_pct  - optional float threshold in percent (default 12.0, unless gain_pct
+                  is given alone, which checks gain only)
       gain_pct  - optional float threshold in percent; omitted = no upside check
-    Returns JSON: {"loss_pct": <float>, "gain_pct": <float|null>, "alerts": [
+    Returns JSON: {"loss_pct": <float|null>, "gain_pct": <float|null>, "alerts": [
     {symbol, period, direction, baseline_date, baseline_close, current_close,
     percent_change}, ... ]}"""
     try:
@@ -2811,10 +2817,13 @@ def watchlist_endpoint():
         loss_pct_param = request.args.get('loss_pct')
         gain_pct_param = request.args.get('gain_pct')
         try:
-            loss_pct = float(loss_pct_param) if loss_pct_param is not None else 12.0
+            loss_pct = float(loss_pct_param) if loss_pct_param is not None else None
             gain_pct = float(gain_pct_param) if gain_pct_param is not None else None
         except ValueError:
             return jsonify({'error': f"Invalid loss_pct/gain_pct value: {loss_pct_param!r}/{gain_pct_param!r}"}), 400
+
+        if loss_pct is None and gain_pct is None:
+            loss_pct = 12.0  # neither given: fall back to the default loss check
 
         alerts = _compute_watchlist_alerts(symbols, loss_pct, gain_pct)
         return jsonify({'loss_pct': loss_pct, 'gain_pct': gain_pct, 'alerts': alerts})
@@ -3830,10 +3839,12 @@ def main():
                         help='Check watch list for drops (and gains, with --gain-pct) vs 1wk/1mo/YTD '
                              'baselines. No value = all tracked symbols; one symbol or comma-separated '
                              'list (e.g. --watchlist AAPL,MSFT). Use with --loss-pct/--gain-pct.')
-    parser.add_argument('--loss-pct', type=float, default=12.0,
-                        help='Loss percent threshold for --watchlist (default: 12.0)')
+    parser.add_argument('--loss-pct', type=float, default=None,
+                        help='Loss percent threshold for --watchlist (default: 12.0, unless '
+                             '--gain-pct is given alone, which checks gain only)')
     parser.add_argument('--gain-pct', type=float, default=None,
-                        help='Gain percent threshold for --watchlist (default: none, upside not checked)')
+                        help='Gain percent threshold for --watchlist (default: none, upside not checked). '
+                             'Given without --loss-pct, only the gain side is checked.')
 
     args = parser.parse_args()
 
@@ -3930,8 +3941,11 @@ def main():
             syms = get_tracked_symbols()
         else:
             syms = [s.strip().upper() for s in args.watchlist.split(',') if s.strip()]
-        alerts = _compute_watchlist_alerts(syms, args.loss_pct, args.gain_pct)
-        _print_watchlist_report(alerts, args.loss_pct, args.gain_pct)
+        loss_pct = args.loss_pct
+        if loss_pct is None and args.gain_pct is None:
+            loss_pct = 12.0  # neither given: fall back to the default loss check
+        alerts = _compute_watchlist_alerts(syms, loss_pct, args.gain_pct)
+        _print_watchlist_report(alerts, loss_pct, args.gain_pct)
         return
 
     if args.export:
