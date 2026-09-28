@@ -149,6 +149,11 @@ DEFAULT_CONFIG = {
 _last_alphavantage_call = 0
 _alphavantage_delay = 12  # 12 seconds = 5 calls per minute (safe for free tier)
 
+# AlphaVantage rarely has MUTUALFUND data (yfinance covers ~95%+ of it); once it
+# misses once in a run, skip it for the rest of this run's mutual funds instead of
+# paying the 12s throttle per symbol for a call that's very likely to fail again.
+_alphavantage_mutualfund_unavailable = False
+
 
 # Setup logging
 logging.basicConfig(
@@ -1012,6 +1017,8 @@ def get_enabled_sources():
 
 def fetch_data_multi_source(symbol, start_date, end_date):
     """Fetch data trying multiple sources with fallback"""
+    global _alphavantage_mutualfund_unavailable
+
     sources = get_enabled_sources()
 
     if not sources:
@@ -1026,6 +1033,12 @@ def fetch_data_multi_source(symbol, start_date, end_date):
             logger.info(f"{source_name}: skipping {symbol} (type {symbol_type} not supported by this provider)")
             continue
 
+        if (source_name == 'alphavantage' and symbol_type == 'MUTUALFUND'
+                and _alphavantage_mutualfund_unavailable):
+            logger.info(f"alphavantage: skipping {symbol} (no MUTUALFUND data earlier this run, "
+                        f"skipping rest to avoid paying the throttle for another likely miss)")
+            continue
+
         try:
             if source_name == 'yfinance':
                 quotes = fetch_yfinance(symbol, start_date, end_date)
@@ -1036,6 +1049,8 @@ def fetch_data_multi_source(symbol, start_date, end_date):
 
                 if source_name == 'alphavantage':
                     quotes = fetch_alphavantage(symbol, start_date, end_date, api_key)
+                    if not quotes and symbol_type == 'MUTUALFUND':
+                        _alphavantage_mutualfund_unavailable = True
 
                 elif source_name == 'fmp':
                     quotes = fetch_fmp(symbol, start_date, end_date, api_key)
@@ -1453,6 +1468,23 @@ def get_last_date_for_symbol(symbol):
     if result and result['last_date']:
         return datetime.strptime(result['last_date'], '%Y-%m-%d').date()
     return None
+
+def get_last_price_for_symbol(symbol):
+    """Get the most recent close price and date stored for a symbol."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT close, quote_date FROM daily_quotes
+        WHERE symbol = ?
+        ORDER BY quote_date DESC
+        LIMIT 1
+    ''', (symbol,))
+    result = cursor.fetchone()
+    conn.close()
+
+    if result and result['close'] is not None:
+        return result['close'], result['quote_date']
+    return None, None
 
 def get_missing_dates(symbol, start_date, end_date):
     """Get list of missing dates (weekdays only, excluding known closures)"""
@@ -2295,6 +2327,13 @@ def update_all_symbols(years=None, since=None):
 
     print(f"\nUpdate complete: {success_count}/{len(symbols)} symbols updated successfully")
     logger.info(f"Update complete: {success_count}/{len(symbols)} successful")
+
+    print(f"\n{'Symbol':<10} {'Price':>12}  {'As of'}")
+    print(f"{'-'*36}")
+    for symbol in symbols:
+        price, quote_date = get_last_price_for_symbol(symbol)
+        price_str = f"${price:,.2f}" if price is not None else "N/A"
+        print(f"{symbol:<10} {price_str:>12}  {quote_date or 'N/A'}")
 
 def auto_fetch_symbol(symbol):
     """Auto-fetch a new symbol (30 days of data)"""
