@@ -2328,13 +2328,6 @@ def update_all_symbols(years=None, since=None):
     print(f"\nUpdate complete: {success_count}/{len(symbols)} symbols updated successfully")
     logger.info(f"Update complete: {success_count}/{len(symbols)} successful")
 
-    print(f"\n{'Symbol':<10} {'Price':>12}  {'As of'}")
-    print(f"{'-'*36}")
-    for symbol in symbols:
-        price, quote_date = get_last_price_for_symbol(symbol)
-        price_str = f"${price:,.2f}" if price is not None else "N/A"
-        print(f"{symbol:<10} {price_str:>12}  {quote_date or 'N/A'}")
-
 def auto_fetch_symbol(symbol):
     """Auto-fetch a new symbol (30 days of data)"""
     logger.info(f"Auto-fetching new symbol: {symbol}")
@@ -2449,7 +2442,10 @@ def get_statistics():
     cursor.execute('''
         SELECT s.symbol, s.name, s.symbol_type, COUNT(dq.quote_date) as quotes,
                MIN(dq.quote_date) as first_date,
-               MAX(dq.quote_date) as last_date
+               MAX(dq.quote_date) as last_date,
+               (SELECT close FROM daily_quotes dq2
+                WHERE dq2.symbol = s.symbol
+                ORDER BY dq2.quote_date DESC LIMIT 1) as last_close
         FROM symbols s
         LEFT JOIN daily_quotes dq ON s.symbol = dq.symbol
         WHERE s.active = 1
@@ -2475,6 +2471,7 @@ def get_statistics():
                 'quotes': row['quotes'],
                 'first_date': row['first_date'] or 'N/A',
                 'last_date': row['last_date'] or 'N/A',
+                'last_close': row['last_close'],
             }
             for row in symbols
         ],
@@ -2485,18 +2482,39 @@ def show_statistics():
     """Show database statistics"""
     stats = get_statistics()
 
-    print(f"\n{'='*90}")
+    print(f"\n{'='*100}")
     print(f"Database: {stats['db_path']}")
     print(f"Total Quotes: {stats['total_quotes']:,}")
     print(f"Market Closures Detected: {stats['closure_count']}")
-    print(f"{'='*90}")
-    print(f"{'Symbol':<10} {'Type':<12} {'Quotes':>10} {'First Date':<12} {'Last Date':<12} {'Name'}")
-    print(f"{'-'*90}")
+    print(f"{'='*100}")
+    print(f"{'Symbol':<10} {'Type':<12} {'Quotes':>10} {'First Date':<12} {'Last Date':<12} {'Price':>12}  {'Name'}")
+    print(f"{'-'*100}")
 
     for row in stats['symbols']:
-        print(f"{row['symbol']:<10} {row['symbol_type']:<12} {row['quotes']:>10,} {row['first_date']:<12} {row['last_date']:<12} {row['name']}")
+        price_str = f"${row['last_close']:,.2f}" if row['last_close'] is not None else "N/A"
+        print(f"{row['symbol']:<10} {row['symbol_type']:<12} {row['quotes']:>10,} {row['first_date']:<12} {row['last_date']:<12} {price_str:>12}  {row['name']}")
 
-    print(f"{'='*90}\n")
+    print(f"{'='*100}\n")
+
+def dump_current_prices():
+    """Print each tracked symbol's current price: live quote if the market is
+    open (or synthetic NAV for money market funds), else the last stored close."""
+    symbols = get_tracked_symbols()
+    if not symbols:
+        print("No symbols tracked")
+        return
+
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z').strip()
+    print(f"\n{'='*36}")
+    print(f"Current Prices (as of {now_str})")
+    print(f"{'='*36}")
+    print(f"{'Symbol':<10} {'Price':>12}")
+    print(f"{'-'*36}")
+    for symbol in symbols:
+        price = get_live_quote(symbol)
+        price_str = f"${price:,.2f}" if price is not None else "N/A"
+        print(f"{symbol:<10} {price_str:>12}")
+    print(f"{'='*36}\n")
 
 def list_market_closures():
     """List all detected market closure dates"""
@@ -3827,7 +3845,8 @@ def main():
     parser.add_argument('--config', nargs='+', help='Config operations: list, get KEY, set KEY VALUE, set apikey SOURCE KEY')
     
     # Info
-    parser.add_argument('--stats', '--statistics', action='store_true', help='Show database statistics')
+    parser.add_argument('--stats', '--statistics', action='store_true', help='Show database statistics (includes last known price per symbol)')
+    parser.add_argument('--prices', action='store_true', help='Dump each tracked symbol\'s current price (live quote if market open, else last close)')
     parser.add_argument('--dbpath', action='store_true', help='Show database path')
     parser.add_argument('--closures', action='store_true', help='List all market closure dates')
     parser.add_argument('--import-closures', nargs='?', const='__BUILTIN__', metavar='FILE',
@@ -3996,6 +4015,10 @@ def main():
     
     if args.stats:
         show_statistics()
+        return
+
+    if args.prices:
+        dump_current_prices()
         return
 
     if args.closures:
