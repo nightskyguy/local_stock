@@ -1,0 +1,20 @@
+# Private API keys. Real keys go in api_keys_donotdisclose.bat (or .sh);
+# my_api_keys.bat is only a SAMPLE with fake keys and stays tracked.
+api_keys_donotdisclose.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+
+# Local data / logs
+*.db
+*.log
+stock_system.lock
+stock_system.port
+stock_system_*.csv
