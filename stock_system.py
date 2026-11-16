@@ -88,9 +88,18 @@ SERVER_PORT_FILE_SECONDARY = os.path.join(os.environ.get('USERPROFILE', os.path.
 # VERSION
 # ============================================================================
 
-__version__ = '1.2.0'
+__version__ = '1.2.1'
 
 CHANGELOG = [
+    {'version': '1.2.1', 'date': '2026-11-16', 'changes': [
+        'Scheduler: a daily update missed because the PC was asleep or the server was off now runs '
+        'as soon as the server is back (was silently skipped: APScheduler allowed 1s of lateness)',
+        'Scheduler: on server start, run a catch-up update if no update has completed since the '
+        'most recent scheduled slot (tracked in config key last_update_run)',
+        'Updates no longer store a still-forming daily candle: before 16:30 ET on a weekday the '
+        'fetch ends at the previous day, so a mid-session update cannot save a partial close that '
+        '--update would never re-fetch',
+    ]},
     {'version': '1.2.0', 'date': '2026-08-10', 'changes': [
         'Fix /chart rendering nothing when a money-market fund is charted with an equity '
         '(date-gap points now serialize as JS null, not Python None)',
@@ -2207,11 +2216,30 @@ def add_money_market_fund(symbol, years=3, expense_ratio=None):
 # SMART UPDATE LOGIC
 # ============================================================================
 
+def _fetch_end_date(now_et=None, today=None):
+    """Last date an update may fetch: the most recent day whose daily candle is final.
+
+    A bulk/scheduled update appends from last-stored-date + 1, so a row saved while the
+    session was still forming (yfinance returns the in-progress candle) would be kept as
+    that day's close and never re-fetched. Before 16:30 ET on a weekday today's candle is
+    not final yet, so stop at the previous ET day. Otherwise (after the close, weekends) it
+    is today's ET date, capped at the local date as before. `now_et` / `today` are
+    injectable for tests."""
+    if now_et is None:
+        now_et = datetime.now(ZoneInfo('America/New_York'))
+    if today is None:
+        today = datetime.now().date()
+    end = now_et.date()
+    if now_et.weekday() < 5 and (now_et.hour, now_et.minute) < (16, 30):
+        end -= timedelta(days=1)  # today's ET session is not final yet (or hasn't opened)
+    return min(end, today)  # never later than the local date (as before)
+
 def smart_update_symbol(symbol, years=None, since=None):
     """
     Smart update that only fetches missing data
     - New symbols: fetch full history (since date, years parameter, or default)
-    - Existing symbols: fetch from last date forward
+    - Existing symbols: fetch from last date forward, up to the last FINAL candle
+      (see _fetch_end_date); --since overrides the start, not the end
     - Money market funds: update synthetic price from FRED yield
     """
     symbol_type = get_symbol_type(symbol)
@@ -2221,7 +2249,7 @@ def smart_update_symbol(symbol, years=None, since=None):
         return True
 
     last_date = get_last_date_for_symbol(symbol)
-    today = datetime.now().date()
+    today = _fetch_end_date()  # end of the fetch window: last day with a final candle
 
     if since:
         # Explicit --since always wins, whether the symbol is new or already
@@ -2327,6 +2355,7 @@ def update_all_symbols(years=None, since=None):
 
     print(f"\nUpdate complete: {success_count}/{len(symbols)} symbols updated successfully")
     logger.info(f"Update complete: {success_count}/{len(symbols)} successful")
+    record_update_run()
 
 def auto_fetch_symbol(symbol):
     """Auto-fetch a new symbol (30 days of data)"""
@@ -3761,30 +3790,96 @@ def export_quotes_to_csv(output_filename = 'stock_system_export.csv', symbol=Non
 # SCHEDULED UPDATES
 # ============================================================================
 
+UPDATE_DAYS = 'mon-sat'            # APScheduler day_of_week for the daily update
+_UPDATE_WEEKDAYS = (0, 1, 2, 3, 4, 5)  # same days as datetime.weekday() (Mon=0 .. Sat=5)
+_LAST_RUN_KEY = 'last_update_run'  # config key: local time the last full update finished
+_update_lock = threading.Lock()    # one scheduled/catch-up update at a time
+
+def record_update_run():
+    """Remember (in the config table) when a full update last finished, so the server can
+    tell on start-up whether it missed the most recent scheduled slot. Never raises."""
+    try:
+        set_config(_LAST_RUN_KEY, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    except Exception as e:
+        logger.error(f"Could not record last update run: {e}")
+
+def _most_recent_update_slot(now, hour, minute):
+    """Latest scheduled slot (a Mon-Sat day at hour:minute, local time) at or before `now`."""
+    slot = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if slot > now:
+        slot -= timedelta(days=1)
+    while slot.weekday() not in _UPDATE_WEEKDAYS:
+        slot -= timedelta(days=1)
+    return slot
+
+def _catchup_needed(now, hour, minute, last_run):
+    """True if no full update finished since the most recent scheduled slot.
+    `last_run` is the stored 'YYYY-MM-DD HH:MM:SS' string (or None if never recorded)."""
+    if not last_run:
+        return True
+    try:
+        last = datetime.strptime(last_run, '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return True
+    return last < _most_recent_update_slot(now, hour, minute)
+
 def scheduled_update():
     """Function called by scheduler for automatic updates"""
-    logger.info("Starting scheduled update")
-    update_all_symbols()
-    logger.info("Scheduled update complete")
+    # Overlap guard: a catch-up run still going when the next slot fires would
+    # otherwise run two bulk updates against the same rows at once.
+    if not _update_lock.acquire(blocking=False):
+        logger.warning("Scheduled update skipped: another update is still running")
+        return
+    try:
+        logger.info("Starting scheduled update")
+        update_all_symbols()
+        logger.info("Scheduled update complete")
+    finally:
+        _update_lock.release()
+
+def _register_update_job(scheduler, hour, minute, **job_kwargs):
+    """Add the daily update job. misfire_grace_time=None lets a run that was missed
+    (PC asleep/hibernating, process suspended) still fire as soon as the scheduler wakes,
+    instead of being dropped after APScheduler's default 1-second grace; coalesce=True
+    collapses several missed slots into a single run."""
+    return scheduler.add_job(
+        scheduled_update,
+        'cron',
+        day_of_week=UPDATE_DAYS,
+        hour=hour,
+        minute=minute,
+        id='daily_update',
+        replace_existing=True,
+        misfire_grace_time=None,
+        coalesce=True,
+        max_instances=1,
+        **job_kwargs
+    )
 
 def start_scheduler():
     """Start background scheduler for automatic updates"""
     update_time = get_config('update_time') or '20:30'
     hour, minute = map(int, update_time.split(':'))
-    
+
     scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        scheduled_update,
-        'cron',
-        day_of_week='mon-sat',
-        hour=hour,
-        minute=minute
-    )
+    _register_update_job(scheduler, hour, minute)
     scheduler.start()
-    
-    logger.info(f"Scheduler started: updates at {update_time} Mon-Sat")
-    print(f"Automatic updates scheduled for {update_time} Mon-Sat")
-    
+
+    logger.info(f"Scheduler started: updates at {update_time} Mon-Sat (missed runs fire on wake)")
+    print(f"Automatic updates scheduled for {update_time} Mon-Sat (a missed run fires when the PC wakes)")
+
+    # The server may have been off (or the PC shut down) across a slot: the in-memory
+    # job cannot know that, so compare against the last recorded finished update.
+    now = datetime.now()
+    last_run = get_config(_LAST_RUN_KEY)
+    if _catchup_needed(now, hour, minute, last_run):
+        slot = _most_recent_update_slot(now, hour, minute)
+        logger.info(f"Catch-up update: last finished update {last_run or 'never recorded'} "
+                    f"is older than the {slot:%Y-%m-%d %H:%M} slot")
+        print(f"Missed the {slot:%Y-%m-%d %H:%M} update - running a catch-up update now")
+        scheduler.add_job(scheduled_update, 'date', run_date=now + timedelta(seconds=5),
+                          id='catchup_update', replace_existing=True, misfire_grace_time=None)
+
     return scheduler
 
 # ============================================================================
